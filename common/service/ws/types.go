@@ -3,26 +3,36 @@ package ws
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
+	"log/slog"
 	"time"
 )
 
 const (
-	MessageTypeEvent            = "event"
-	MessageTypeEventFd          = "event:fd"
-	MessageTypeCompose          = "compose:%s"
-	MessageTypeComposeLog       = "compose:log:%s"
-	MessageTypeConsole          = "/console/container/%s"
-	MessageTypeConsoleHost      = "/console/host/%s"
-	MessageTypeContainerLog     = "container:log:%s"
-	MessageTypeContainerAllStat = "container:stat"
-	MessageTypeContainerStat    = "container:stat:%s"
-	MessageTypeContainerBackup  = "container:backup:%d"
-	MessageTypeImagePull        = "image:pull:%s"
-	MessageTypeImageBuild       = "image:build:%d"
-	MessageTypeImageImport      = "image:import"
-	MessageTypeProgressClose    = "progress:close"
-	MessageTypeDomainApply      = "domain:apply"
-	MessageTypeUserPermission   = "user:permission:%s"
+	MessageTypeEvent                  = "event"
+	MessageTypeEventFd                = "event:fd"
+	MessageTypeEventRefresh           = "event:refresh" // 后台主动刷新前端
+	MessageTypeEventRefreshDockerEnv  = "event:refresh:dockerEnv"
+	MessageTypeCompose                = "compose:%s"
+	MessageTypeComposeLog             = "compose:log:%s"
+	MessageTypeConsole                = "/console/container/%s"
+	MessageTypeConsoleSsh             = "/console/ssh/%s"
+	MessageTypeConsoleShell           = "/console/shell"
+	MessageTypeContainerLog           = "container:log:%s"
+	MessageTypeContainerCommandCreate = "container:command:create:%s"
+	MessageTypeContainerAllStat       = "container:stat"
+	MessageTypeContainerStat          = "container:stat:%s"
+	MessageTypeContainerExplorer      = "container:explorer"
+	MessageTypeDiskUsage              = "stat:diskUsage"
+	MessageTypeContainerBackup        = "container:backup:%d"
+	MessageTypeImagePull              = "image:pull:%s"
+	MessageTypeImageBuild             = "image:build:%d"
+	MessageTypeImageImport            = "image:import"
+	MessageTypeProgressClose          = "progress:close"
+	MessageTypeDomainApply            = "domain:apply"
+	MessageTypeUserPermission         = "user:permission:%s"
+	MessageTypeSwarmLog               = "swarm:log:%s:%s"
+	MessageTypeNginxLog               = "nginx:log"
 )
 
 type RespMessage struct {
@@ -30,6 +40,39 @@ type RespMessage struct {
 	Type   string      `json:"type"`
 	Data   interface{} `json:"data"`
 	RespAt time.Time   `json:"respAt,omitempty"`
+}
+
+func NewRespMessage(fd, messageType string, data interface{}) (message *RespMessage) {
+	message = &RespMessage{
+		Fd:     fd,
+		Type:   messageType,
+		Data:   data,
+		RespAt: time.Now(),
+	}
+	if message.Data == nil {
+		return message
+	}
+
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Warn("ws snapshot message panic", "type", message.Type, "error", fmt.Sprint(r))
+			message.Data = fmt.Sprintf("snapshot ws message failed: %v", r)
+		}
+	}()
+
+	switch v := message.Data.(type) {
+	case json.RawMessage:
+		message.Data = append(json.RawMessage(nil), v...)
+	case string, int, int64, float64, bool:
+	default:
+		if b, err := json.Marshal(v); err == nil {
+			message.Data = json.RawMessage(b)
+		} else {
+			slog.Warn("ws snapshot message", "type", message.Type, "error", err.Error())
+			message.Data = err.Error()
+		}
+	}
+	return message
 }
 
 func (self RespMessage) ToJson() []byte {

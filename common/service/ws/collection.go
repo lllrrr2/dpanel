@@ -2,15 +2,17 @@ package ws
 
 import (
 	"context"
-	"github.com/donknap/dpanel/app/common/logic"
-	"github.com/donknap/dpanel/common/service/notice"
-	"github.com/donknap/dpanel/common/service/plugin"
-	"github.com/donknap/dpanel/common/service/storage"
-	"github.com/gorilla/websocket"
 	"log/slog"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/donknap/dpanel/app/common/logic"
+	"github.com/donknap/dpanel/common/service/docker"
+	"github.com/donknap/dpanel/common/service/notice"
+	"github.com/donknap/dpanel/common/service/storage"
+	"github.com/donknap/dpanel/common/types/event"
+	"github.com/we7coreteam/w7-rangine-go/v2/pkg/support/facade"
 )
 
 var (
@@ -42,7 +44,10 @@ func (self *Collection) Join(c *Client) {
 }
 
 func (self *Collection) Leave(c *Client) {
-	self.clients.Delete(c.Fd)
+	if _, loaded := self.clients.LoadAndDelete(c.Fd); !loaded {
+		return
+	}
+	_ = c.Conn.Close()
 
 	self.progressPip.Range(func(key, value any) bool {
 		if v, ok := value.(*ProgressPip); ok && !v.IsKeepAlive {
@@ -66,7 +71,7 @@ func (self *Collection) Leave(c *Client) {
 					})
 					if !hasConnect {
 						storage.Cache.Delete(key)
-						slog.Debug("ws leave delete cache userinfo", "key", key, "user", v)
+						slog.Info("ws leave delete cache userinfo", "key", key, "user", v)
 					}
 				}
 			}
@@ -82,31 +87,32 @@ func (self *Collection) Leave(c *Client) {
 			}
 			return true
 		})
-		// 没有任何用户时，中断 docker 的所有请求
-		slog.Debug("docker client cancel")
-
+		slog.Info("docker client cancel")
+		facade.Event.Publish(event.PluginDestroyExplorer, event.DockerDaemonPayload{
+			DockerEnvName: docker.Sdk.DockerEnv.Name,
+		})
 		//docker.Sdk.CtxCancelFunc()
 		//docker.Sdk.Client.Close()
 		//ctx, cancelFunc := context.WithCancel(context.Background())
 		//docker.Sdk.Ctx = ctx
 		//docker.Sdk.CtxCancelFunc = cancelFunc
 		//go logic.EventLogic{}.MonitorLoop()
-		explorer, _ := plugin.NewPlugin(plugin.PluginExplorer, nil)
-		_ = explorer.Destroy()
 	}
 }
 
 func (self *Collection) sendMessage(message *RespMessage) {
-	lock.Lock()
-	lock.Unlock()
 	self.clients.Range(func(key, value any) bool {
-		c := value.(*Client)
+		c, ok := value.(*Client)
+		if !ok {
+			return true
+		}
 		if message.Fd != "" && c.Fd != message.Fd {
 			return true
 		}
-		err := c.Conn.WriteMessage(websocket.TextMessage, message.ToJson())
+		err := c.SendMessage(message)
 		if err != nil {
-			slog.Debug("ws broadcast error", "fd", c.Fd, "error", err.Error())
+			slog.Warn("ws broadcast error", "fd", c.Fd, "error", err.Error())
+			self.Leave(c)
 		}
 		return true
 	})
@@ -119,11 +125,7 @@ func (self *Collection) Broadcast() {
 			self.sendMessage(message)
 
 		case message := <-notice.QueueNoticePushMessage:
-			data := &RespMessage{
-				Type: "notice",
-				Data: message,
-			}
-			self.sendMessage(data)
+			self.sendMessage(NewRespMessage("", "notice", message))
 		}
 	}
 }

@@ -6,15 +6,20 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/donknap/dpanel/app/common/logic"
-	"github.com/donknap/dpanel/app/ctrl/sdk/types"
-	"github.com/golang-jwt/jwt/v5"
-	"github.com/we7coreteam/w7-rangine-go/v2/pkg/support/facade"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"time"
+
+	"github.com/donknap/dpanel/app/common/logic"
+	"github.com/donknap/dpanel/app/ctrl/sdk/types"
+	"github.com/donknap/dpanel/common/function"
+	"github.com/gin-gonic/gin"
+	"github.com/golang-jwt/jwt/v5"
+	"github.com/we7coreteam/w7-rangine-go/v2/pkg/support/facade"
 )
 
 const (
@@ -37,14 +42,16 @@ type Client struct {
 }
 
 func (self *Client) Post(uri string, payload any) (data io.Reader, err error) {
+	slog.Debug("ctrl command", "uri", uri, "data", payload)
 	postData := new(bytes.Buffer)
-	if payload != nil {
-		jsonData, err := json.Marshal(payload)
-		if err != nil {
-			return nil, err
-		}
-		postData.Write(jsonData)
+	if payload == nil {
+		payload = gin.H{}
 	}
+	jsonData, err := json.Marshal(payload)
+	if err != nil {
+		return nil, err
+	}
+	postData.Write(jsonData)
 	uri, err = url.JoinPath(self.apiUrl, uri)
 	if err != nil {
 		return nil, err
@@ -79,7 +86,13 @@ func (self *Client) Post(uri string, payload any) (data io.Reader, err error) {
 			return nil, errors.New("invalid auth token, please configure the DP_JWT_SECRET environment variable of the dpanel container")
 		case 200:
 			buffer := new(bytes.Buffer)
-			err = json.NewEncoder(buffer).Encode(responseMessage.Data)
+			// 如果是 success 返回整个结构，如果有具体的数据，则返回数据
+			switch responseMessage.Data.(type) {
+			case string:
+				err = json.NewEncoder(buffer).Encode(responseMessage)
+			default:
+				err = json.NewEncoder(buffer).Encode(responseMessage.Data)
+			}
 			return buffer, err
 		}
 	} else {
@@ -93,15 +106,23 @@ func (self *Client) token() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	jwtSecret := logic.User{}.GetJwtSecret()
-	jwtClaims := jwt.NewWithClaims(jwt.SigningMethodHS256, logic.UserInfo{
+	privateKeyContent, err := os.ReadFile(facade.GetConfig().GetString("system.rsa.key"))
+	if err != nil {
+		return "", err
+	}
+	privateKey, err := function.RSAParsePrivateKey(privateKeyContent)
+	if err != nil {
+		return "", err
+	}
+	jwtClaims := jwt.NewWithClaims(jwt.SigningMethodRS512, logic.UserInfo{
 		UserId:       currentUser.ID,
 		Username:     currentUser.Value.Username,
 		RoleIdentity: currentUser.Name,
 		AutoLogin:    true,
 		RegisteredClaims: jwt.RegisteredClaims{
 			ExpiresAt: jwt.NewNumericDate(time.Now().Add(self.tokenExpire)),
+			IssuedAt:  jwt.NewNumericDate(time.Now()),
 		},
 	})
-	return jwtClaims.SignedString(jwtSecret)
+	return jwtClaims.SignedString(privateKey)
 }

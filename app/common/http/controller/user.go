@@ -1,20 +1,21 @@
 package controller
 
 import (
+	"log/slog"
+
 	"github.com/donknap/dpanel/app/common/logic"
+	"github.com/donknap/dpanel/app/common/logic/oauth"
 	"github.com/donknap/dpanel/common/accessor"
-	"github.com/donknap/dpanel/common/dao"
-	"github.com/donknap/dpanel/common/entity"
 	"github.com/donknap/dpanel/common/function"
 	"github.com/donknap/dpanel/common/service/docker"
 	"github.com/donknap/dpanel/common/service/family"
-	"github.com/donknap/dpanel/common/service/notice"
+	"github.com/donknap/dpanel/common/service/storage"
 	"github.com/donknap/dpanel/common/types"
+	"github.com/donknap/dpanel/common/types/define"
 	"github.com/gin-gonic/gin"
 	"github.com/pquerna/otp/totp"
 	"github.com/we7coreteam/w7-rangine-go/v2/pkg/support/facade"
 	"github.com/we7coreteam/w7-rangine-go/v2/src/http/controller"
-	"time"
 )
 
 type User struct {
@@ -33,16 +34,16 @@ func (self User) Login(http *gin.Context) {
 		return
 	}
 
-	if !new(family.Provider).Check(types.FeatureFamilyCe) {
+	if !function.InArray((family.Provider{}).Feature(), types.FeatureFamilyCe) {
 		twoFa := accessor.TwoFa{}
 		exists := logic.Setting{}.GetByKey(logic.SettingGroupSetting, logic.SettingGroupSettingTwoFa, &twoFa)
 		if exists && twoFa.Enable {
 			if params.Code == "" {
-				self.JsonResponseWithError(http, function.ErrorMessage(".userTwoFaEmpty"), 500)
+				self.JsonResponseWithError(http, function.ErrorMessage(define.ErrorMessageUserTwoFaEmpty), 500)
 				return
 			}
 			if !totp.Validate(params.Code, twoFa.Secret) {
-				self.JsonResponseWithError(http, function.ErrorMessage(".userTwoFaNotCorrect"), 500)
+				self.JsonResponseWithError(http, function.ErrorMessage(define.ErrorMessageUserTwoFaNotCorrect), 500)
 				return
 			}
 		}
@@ -50,8 +51,8 @@ func (self User) Login(http *gin.Context) {
 	var code string
 	var err error
 
-	if new(logic.User).CheckLock(params.Username) {
-		self.JsonResponseWithError(http, notice.Message{}.New(".userFailedLock", "time", "15"), 500)
+	if err = new(logic.User).CheckLock(params.Username); err != nil {
+		self.JsonResponseWithError(http, err, 500)
 		return
 	}
 
@@ -61,21 +62,21 @@ func (self User) Login(http *gin.Context) {
 
 	currentUser, err := logic.User{}.GetUserByUsername(params.Username)
 	if err != nil {
-		self.JsonResponseWithError(http, notice.Message{}.New(".usernameOrPasswordError"), 500)
+		self.JsonResponseWithError(http, function.ErrorMessage(define.ErrorMessageUserUsernameOrPasswordError), 500)
 		return
 	}
 	if currentUser.Value.Password == "" {
-		self.JsonResponseWithError(http, notice.Message{}.New(".usernameOrPasswordError"), 500)
+		self.JsonResponseWithError(http, function.ErrorMessage(define.ErrorMessageUserUsernameOrPasswordError), 500)
 		return
 	}
 
 	if currentUser.Value.UserStatus == logic.SettingGroupUserStatusDisable {
-		self.JsonResponseWithError(http, notice.Message{}.New(".userDisable"), 500)
+		self.JsonResponseWithError(http, function.ErrorMessage(define.ErrorMessageUserDisable), 500)
 		return
 	}
 
-	if !(family.Provider{}).Check(types.FeatureFamilyEe) && currentUser.Name != logic.SettingGroupUserFounder {
-		self.JsonResponseWithError(http, notice.Message{}.New(".userDisable"), 500)
+	if !function.InArray((family.Provider{}).Feature(), types.FeatureFamilyEe) && currentUser.Name != logic.SettingGroupUserFounder {
+		self.JsonResponseWithError(http, function.ErrorMessage(define.ErrorMessageUserDisable), 500)
 		return
 	}
 
@@ -86,12 +87,18 @@ func (self User) Login(http *gin.Context) {
 			self.JsonResponseWithError(http, err, 500)
 			return
 		}
+		redirect := "/home/overview"
+		loginSetting := accessor.Login{}
+		if ok := (logic.Setting{}).GetByKey(logic.SettingGroupSetting, logic.SettingGroupSettingLogin, &loginSetting); ok && loginSetting.DefaultRedirect != "" {
+			redirect = loginSetting.DefaultRedirect
+		}
 		self.JsonResponseWithoutError(http, gin.H{
 			"accessToken": code,
+			"redirect":    redirect,
 		})
 		return
 	} else {
-		self.JsonResponseWithError(http, notice.Message{}.New(".usernameOrPasswordError"), 500)
+		self.JsonResponseWithError(http, function.ErrorMessage(define.ErrorMessageUserUsernameOrPasswordError), 500)
 		return
 	}
 }
@@ -100,11 +107,12 @@ func (self User) GetUserInfo(http *gin.Context) {
 	result := gin.H{
 		"menu":      make([]string, 0),
 		"themeUser": make(map[string]string),
+		"locale":    make([]string, 0),
 	}
 
 	data, exists := http.Get("userInfo")
 	if !exists {
-		self.JsonResponseWithError(http, function.ErrorMessage(".login"), 401)
+		self.JsonResponseWithError(http, function.ErrorMessage(define.ErrorMessageUserLogin), 401)
 		http.AbortWithStatus(401)
 		return
 	}
@@ -112,14 +120,18 @@ func (self User) GetUserInfo(http *gin.Context) {
 
 	feature := make([]string, 0)
 
-	if facade.GetConfig().GetString("app.env") == "lite" {
+	if facade.GetConfig().GetString("app.env") == define.PanelAppEnvLite {
 		feature = append(feature, types.FeatureVersionEnvLite)
 	} else {
 		feature = append(feature, types.FeatureVersionEnvStandard)
 	}
 
-	if docker.Sdk.Name == docker.DefaultClientName {
+	if docker.Sdk.Name == define.DockerDefaultClientName {
 		feature = append(feature, types.FeatureDockerEnvLocal)
+	}
+
+	if info, err := docker.Sdk.Client.Info(docker.Sdk.Ctx); err == nil && info.Swarm.ControlAvailable {
+		feature = append(feature, types.FeatureSwarmManage)
 	}
 
 	result["feature"] = append(feature, family.Provider{}.Feature()...)
@@ -128,6 +140,9 @@ func (self User) GetUserInfo(http *gin.Context) {
 	logic.Setting{}.GetByKey(logic.SettingGroupSetting, logic.SettingGroupSettingThemeConfig, &themeConfig)
 	result["theme"] = themeConfig
 
+	if v, ok := storage.Cache.Get(storage.CacheKeySettingLocale); ok {
+		result["locale"] = v.([]string)
+	}
 	self.JsonResponseWithoutError(http, result)
 	return
 }
@@ -135,19 +150,22 @@ func (self User) GetUserInfo(http *gin.Context) {
 func (self User) LoginInfo(http *gin.Context) {
 	result := gin.H{
 		"showRegister":  false,
-		"showBuildName": true,
+		"showBuildName": false,
 		"family":        facade.GetConfig().GetString("app.env"),
 		"feature":       family.Provider{}.Feature(),
 		"appName":       facade.GetConfig().GetString("app.name"),
 	}
-	_, err := logic.Setting{}.GetDPanelInfo()
-	if err == nil {
-		result["showBuildName"] = false
+	dpanelInfo := logic.Setting{}.GetDPanelInfo()
+	if dpanelInfo.RunIn == types.DPanelRunInContainer && dpanelInfo.ContainerInfo.ContainerJSONBase == nil {
+		result["showBuildName"] = true
 	}
-	_, err = logic.Setting{}.GetValue(logic.SettingGroupUser, logic.SettingGroupUserFounder)
+	_, err := logic.Setting{}.GetValue(logic.SettingGroupUser, logic.SettingGroupUserFounder)
 	if err != nil {
 		result["showRegister"] = true
 	}
+	theme := accessor.ThemeConfig{}
+	logic.Setting{}.GetByKey(logic.SettingGroupSetting, logic.SettingGroupSettingThemeConfig, &theme)
+	result["theme"] = theme
 	self.JsonResponseWithoutError(http, result)
 	return
 }
@@ -164,34 +182,93 @@ func (self User) CreateFounder(http *gin.Context) {
 	}
 	founder, _ := logic.Setting{}.GetValue(logic.SettingGroupUser, logic.SettingGroupUserFounder)
 	if founder != nil {
-		self.JsonResponseWithError(http, notice.Message{}.New(".userFounderExists"), 500)
+		self.JsonResponseWithError(http, function.ErrorMessage(define.ErrorMessageUserFounderExists), 500)
 		return
 	}
 	if params.Password != params.ConfirmPassword {
-		self.JsonResponseWithError(http, notice.Message{}.New(".userPasswordConfirmFailed"), 500)
+		self.JsonResponseWithError(http, function.ErrorMessage(define.ErrorMessageUserPasswordConfirmFailed), 500)
 		return
 	}
 
 	if (logic.User{}.GetBuiltInPublicUsername()) == params.Username {
-		self.JsonResponseWithServerError(http, notice.Message{}.New(".userFounderExists"))
+		self.JsonResponseWithServerError(http, function.ErrorMessage(define.ErrorMessageUserFounderExists))
 		return
 	}
 
-	registerAt := time.Now()
-	err := dao.Setting.Create(&entity.Setting{
-		GroupName: logic.SettingGroupUser,
-		Name:      logic.SettingGroupUserFounder,
-		Value: &accessor.SettingValueOption{
-			Password:   logic.User{}.GetMd5Password(params.Password, params.Username),
-			Username:   params.Username,
-			UserStatus: logic.SettingGroupUserStatusEnable,
-			RegisterAt: &registerAt,
-		},
-	})
-	if err != nil {
+	if _, err := (logic.User{}).CreateFounderUser(params.Username, params.Password); err != nil {
 		self.JsonResponseWithError(http, err, 500)
 		return
 	}
 	self.JsonSuccessResponse(http)
+	return
+}
+
+func (self User) OauthCallback(http *gin.Context) {
+	type ParamsValidate struct {
+		Provider    string `json:"provider"`
+		Code        string `json:"code" binding:"required"`
+		State       string `json:"state"`
+		RedirectURI string `json:"redirect_uri"`
+		RedirectUri string `json:"redirectUri"`
+	}
+	params := ParamsValidate{}
+	if !self.Validate(http, &params) {
+		return
+	}
+	if params.RedirectURI == "" {
+		params.RedirectURI = params.RedirectUri
+	}
+	if params.Provider == "" {
+		params.Provider = oauth.ProviderFnnas
+	}
+	slog.Debug("oauth callback",
+		"provider", params.Provider,
+		"codeEmpty", params.Code == "",
+		"stateEmpty", params.State == "",
+		"redirectURIEmpty", params.RedirectURI == "",
+	)
+
+	accessToken, err := oauth.Exchange(params.Provider, oauth.ExchangeOption{
+		Code:        params.Code,
+		State:       params.State,
+		RedirectURI: params.RedirectURI,
+	})
+	if err != nil {
+		slog.Debug("oauth callback failed", "provider", params.Provider, "error", err.Error())
+		self.JsonResponseWithError(http, err, 500)
+		return
+	}
+	self.JsonResponseWithoutError(http, gin.H{
+		"accessToken": accessToken,
+	})
+	return
+}
+
+func (self User) OauthProviders(http *gin.Context) {
+	result := make([]oauth.Item, 0)
+	for _, provider := range []oauth.Provider{
+		oauth.Fnnas{},
+	} {
+		if item, ok := provider.Item(); ok {
+			result = append(result, item)
+		}
+	}
+	self.JsonResponseWithoutError(http, gin.H{
+		"list": result,
+	})
+	slog.Debug("oauth providers", "count", len(result), "path", http.Request.URL.Path, "host", http.Request.Host)
+	return
+}
+
+func (self User) OauthAuthorize(http *gin.Context) {
+	provider := http.Query("provider")
+	callbackURL, err := oauth.Authorize(provider, http.Request)
+	if err != nil {
+		slog.Debug("oauth authorize failed", "provider", provider, "error", err.Error())
+		self.JsonResponseWithError(http, err, 500)
+		return
+	}
+	slog.Debug("oauth authorize redirect", "provider", provider, "callbackURLGenerated", callbackURL != "")
+	http.Redirect(302, callbackURL)
 	return
 }

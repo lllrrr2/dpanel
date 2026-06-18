@@ -1,30 +1,23 @@
 package compose
 
 import (
-	"bufio"
-	"bytes"
-	"encoding/json"
 	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+
 	"github.com/compose-spec/compose-go/v2/types"
-	"github.com/docker/docker/api/types/network"
 	"github.com/donknap/dpanel/common/function"
 	"github.com/donknap/dpanel/common/service/docker"
-	"github.com/donknap/dpanel/common/service/exec"
-	"io"
-	"log/slog"
-	"os"
-	"strings"
 )
 
-// docker compose 任务执行，包含 部署，销毁，控制
-
 type Task struct {
-	Name     string
-	Composer *Wrapper
-	Status   string
+	Name    string
+	Project *types.Project
 }
 
-func (self Task) Deploy(serviceName []string, removeOrphans bool, pullImage bool) (io.Reader, error) {
+func (self Task) Deploy(removeOrphans bool, pullImage bool) (io.ReadCloser, error) {
 	cmd := []string{
 		//"--progress", "tty",
 		"up", "-d", "--build",
@@ -36,35 +29,33 @@ func (self Task) Deploy(serviceName []string, removeOrphans bool, pullImage bool
 		cmd = append(cmd, "--remove-orphans")
 	}
 
-	if !function.IsEmptyArray(serviceName) {
-		cmd = append(cmd, serviceName...)
+	if !function.IsEmptyArray(self.Project.DisabledServiceNames()) {
+		cmd = append(cmd, self.Project.ServiceNames()...)
 	}
 
 	response, err := self.runCommand(cmd)
 	if err != nil {
 		return nil, err
 	}
-	for _, item := range self.Composer.Project.Networks {
-		for _, serviceItem := range self.Composer.Project.Services {
-			for _, linkItem := range serviceItem.ExternalLinks {
-				links := strings.Split(linkItem, ":")
-				if len(links) == 2 {
-					_ = docker.Sdk.Client.NetworkConnect(docker.Sdk.Ctx, item.Name, links[0], &network.EndpointSettings{})
-				}
-			}
-		}
-	}
 	return response, nil
 }
 
-func (self Task) Destroy(deleteImage bool, deleteVolume bool) (io.Reader, error) {
+func (self Task) Build() (io.ReadCloser, error) {
+	cmd := []string{
+		//"--progress", "tty",
+		"build",
+	}
+	return self.runCommand(cmd)
+}
+
+func (self Task) Destroy(deleteImage bool, deleteVolume bool) (io.ReadCloser, error) {
 	cmd := []string{
 		//"--progress", "tty",
 		"down", "--remove-orphans",
 	}
 	// 删除compose 前需要先把关联的已有容器网络退出
-	for _, item := range self.Composer.Project.Networks {
-		for _, serviceItem := range self.Composer.Project.Services {
+	for _, item := range self.Project.Networks {
+		for _, serviceItem := range self.Project.Services {
 			for _, linkItem := range serviceItem.ExternalLinks {
 				links := strings.Split(linkItem, ":")
 				if len(links) == 2 {
@@ -81,10 +72,15 @@ func (self Task) Destroy(deleteImage bool, deleteVolume bool) (io.Reader, error)
 	if deleteVolume {
 		cmd = append(cmd, "--volumes")
 	}
+
+	if !function.IsEmptyArray(self.Project.DisabledServiceNames()) {
+		cmd = append(cmd, self.Project.DisabledServiceNames()...)
+	}
+
 	return self.runCommand(cmd)
 }
 
-func (self Task) Ctrl(op string) (io.Reader, error) {
+func (self Task) Ctrl(op string) (io.ReadCloser, error) {
 	cmd := []string{
 		//"--progress", "tty",
 		op,
@@ -109,94 +105,51 @@ func (self Task) Logs(tail int, showTime, follow bool) (io.ReadCloser, error) {
 	return self.runCommand(cmd)
 }
 
-func (self Task) Project() *types.Project {
-	return self.Composer.Project
-}
-
-type ContainerResult struct {
-	Name       string                      `json:"name"`
-	Service    string                      `json:"service"`
-	Publishers []ContainerPublishersResult `json:"publishers"`
-	State      string                      `json:"state"`
-	Status     string                      `json:"status"`
-}
-
-type ContainerPublishersResult struct {
-	URL           string `json:"url"`
-	TargetPort    uint16 `json:"targetPort"`
-	PublishedPort uint16 `json:"publishedPort"`
-	Protocol      string `json:"protocol"`
-}
-
-func (self Task) Ps() []*ContainerResult {
-	result := make([]*ContainerResult, 0)
-	if self.Name == "" {
-		return result
-	}
-	// self.runCommand 只负责执行，Ps 命令需要返回结果
-	args := self.Composer.GetBaseCommand()
-	args = append(args, "ps", "--format", "json", "--all")
-
-	cmd, err := exec.New(docker.Sdk.GetComposeCmd(args...)...)
-	if err != nil {
-		return result
-	}
-
-	out := cmd.RunWithResult()
-	if out == "" {
-		return result
-	}
-
-	if strings.HasPrefix(out, "[{") {
-		// 兼容 docker-compose ps 返回数据
-		temp := make([]*ContainerResult, 0)
-		err := json.Unmarshal([]byte(out), &temp)
-		if err != nil {
-			slog.Debug("compose task docker-compose failed", err.Error())
-			return nil
-		}
-		return temp
-	} else {
-		newReader := bufio.NewReader(bytes.NewReader([]byte(out)))
-		line := make([]byte, 0)
-		for {
-			t, isPrefix, err := newReader.ReadLine()
-			if err == io.EOF {
-				break
-			}
-			line = append(line, t...)
-			if isPrefix {
-				continue
-			}
-			temp := ContainerResult{}
-			err = json.Unmarshal(line, &temp)
-			if err == nil {
-				result = append(result, &temp)
-			}
-			line = make([]byte, 0)
-		}
-		return result
-	}
-}
-
-func (self Task) GetYaml() ([2]string, error) {
-	yaml := [2]string{
-		"", "",
-	}
-	for i, uri := range self.Project().ComposeFiles {
-		content, err := os.ReadFile(uri)
-		if err == nil {
-			yaml[i] = string(content)
-		}
-	}
-	return yaml, nil
-}
-
 func (self Task) runCommand(command []string) (io.ReadCloser, error) {
-	command = append(self.Composer.GetBaseCommand(), command...)
-	cmd, err := exec.New(docker.Sdk.GetComposeCmd(command...)...)
+	// dpanel 运行环境和远程 docker 可能环境不同，这里的命令统一采用相对目录的形式来处理
+	// 如果当前是 windows 系统，则强制使用 /home/dpanel/ 做为数据目录
+	cmd := make([]string, 0)
+	cmd = append(cmd, "--project-directory", self.Project.WorkingDir)
+	for _, file := range self.Project.ComposeFiles {
+		if v, err := filepath.Rel(self.Project.WorkingDir, file); err == nil {
+			cmd = append(cmd, "-f", v)
+		}
+	}
+	cmd = append(cmd, "-p", self.Project.Name)
+	for _, envFileName := range []string{
+		".env",
+	} {
+		envFilePath := filepath.Join(self.Project.WorkingDir, envFileName)
+		_, err := os.Stat(envFilePath)
+		if err == nil {
+			cmd = append(cmd, "--env-file", envFileName)
+		}
+	}
+	cmd = append(cmd, command...)
+	exec, err := docker.Sdk.Compose(cmd...)
 	if err != nil {
 		return nil, err
 	}
-	return cmd.RunInPip()
+	if self.Project != nil && self.Project.Environment != nil {
+		exec.AppendEnv(function.PluckMapWalkArray(self.Project.Environment, func(k string, v string) (string, bool) {
+			return fmt.Sprintf("%s=%s", k, v), true
+		}))
+	}
+	exec.WorkDir(self.Project.WorkingDir)
+	return exec.RunInPip()
+}
+
+// GetService 区别于 Project.GetService 方法，此方法会将扩展信息一起返回
+func (self Task) GetService(name string) (types.ServiceConfig, ExtService, error) {
+	service, err := self.Project.GetService(name)
+	if err != nil {
+		return types.ServiceConfig{}, ExtService{}, err
+	}
+
+	ext := ExtService{}
+	exists, err := service.Extensions.Get(ExtensionServiceName, &ext)
+	if err == nil && exists {
+		return service, ext, nil
+	}
+	return service, ExtService{}, nil
 }

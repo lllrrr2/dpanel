@@ -2,25 +2,25 @@ package controller
 
 import (
 	"fmt"
-	"github.com/docker/docker/api/types"
-	"github.com/donknap/dpanel/app/common/logic"
-	"github.com/donknap/dpanel/common/accessor"
-	"github.com/donknap/dpanel/common/entity"
-	"github.com/donknap/dpanel/common/function"
-	"github.com/donknap/dpanel/common/service/docker"
-	"github.com/donknap/dpanel/common/service/ssh"
-	"github.com/donknap/dpanel/common/service/storage"
-	"github.com/donknap/dpanel/common/types/event"
-	"github.com/gin-gonic/gin"
-	"github.com/we7coreteam/w7-rangine-go/v2/pkg/support/facade"
-	"github.com/we7coreteam/w7-rangine-go/v2/src/http/controller"
-	"log/slog"
 	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/donknap/dpanel/app/common/logic"
+	"github.com/donknap/dpanel/common/function"
+	"github.com/donknap/dpanel/common/service/docker"
+	types2 "github.com/donknap/dpanel/common/service/docker/types"
+	event2 "github.com/donknap/dpanel/common/service/notice"
+	"github.com/donknap/dpanel/common/service/ssh"
+	"github.com/donknap/dpanel/common/service/storage"
+	"github.com/donknap/dpanel/common/types/define"
+	"github.com/donknap/dpanel/common/types/event"
+	"github.com/gin-gonic/gin"
+	"github.com/we7coreteam/w7-rangine-go/v2/pkg/support/facade"
+	"github.com/we7coreteam/w7-rangine-go/v2/src/http/controller"
 )
 
 type Env struct {
@@ -28,34 +28,77 @@ type Env struct {
 }
 
 func (self Env) GetList(http *gin.Context) {
-	result := make([]*docker.Client, 0)
-
-	setting, err := logic.Setting{}.GetValue(logic.SettingGroupSetting, logic.SettingGroupSettingDocker)
-	if err == nil {
-		for _, item := range setting.Value.Docker {
-			result = append(result, item)
-		}
+	type ParamsValidate struct {
+		EnableCertContent bool `json:"enableCertContent"`
 	}
-	currentName := "local"
-	for _, item := range result {
-		if item.Address == docker.Sdk.Client.DaemonHost() || strings.HasSuffix(docker.Sdk.Client.DaemonHost(), fmt.Sprintf("/sock/%s.sock", item.Name)) {
-			currentName = item.Name
-			break
+	params := ParamsValidate{}
+	if !self.Validate(http, &params) {
+		return
+	}
+
+	var current types2.DockerEnv
+
+	result := make([]*types2.DockerEnv, 0)
+	if setting, err := (logic.Setting{}).GetValue(logic.SettingGroupSetting, logic.SettingGroupSettingDocker); err == nil {
+		for _, item := range setting.Value.Docker {
+			if params.EnableCertContent && item.EnableTLS {
+				if content, err := os.ReadFile(function.SafePathJoin(storage.Local{}.GetCertPath(), item.TlsCa)); err == nil {
+					item.TlsCa = string(content)
+				} else {
+					item.TlsCa = ""
+				}
+				if content, err := os.ReadFile(function.SafePathJoin(storage.Local{}.GetCertPath(), item.TlsCert)); err == nil {
+					item.TlsCert = string(content)
+				} else {
+					item.TlsCert = ""
+				}
+				if content, err := os.ReadFile(function.SafePathJoin(storage.Local{}.GetCertPath(), item.TlsKey)); err == nil {
+					item.TlsKey = string(content)
+				} else {
+					item.TlsKey = ""
+				}
+			}
+			if docker.Sdk.Name == item.Name {
+				current = *item
+			}
+			result = append(result, item)
 		}
 	}
 	sort.Slice(result, func(i, j int) bool {
 		return result[i].Name < result[j].Name
 	})
 	self.JsonResponseWithoutError(http, gin.H{
-		"currentName": currentName,
-		"list":        result,
+		"currentName":  current.Name,
+		"currentTitle": current.Title,
+		"list": function.PluckArrayWalk(result, func(item *types2.DockerEnv) (*types2.DockerEnv, bool) {
+			status := types2.DockerStatus{
+				Available: false,
+				Message:   "",
+			}
+			if v, ok := storage.Cache.Get(fmt.Sprintf(storage.CacheKeyDockerStatus, item.Name)); ok {
+				status = v.(types2.DockerStatus)
+			}
+			item.DockerStatus = &status
+			if item.SshServerInfo != nil {
+				if item.SshServerInfo.Password != "" {
+					item.SshServerInfo.Password = function.MaskSensitiveValue(item.SshServerInfo.Password)
+				}
+				if item.SshServerInfo.PrivateKey != "" {
+					item.SshServerInfo.PrivateKey = function.MaskSensitiveValue(item.SshServerInfo.PrivateKey)
+				}
+			}
+			if item.TlsKey != "" {
+				item.TlsKey = function.MaskSensitiveValue(item.TlsKey)
+			}
+			return item, true
+		}),
 	})
 	return
 }
 
 func (self Env) Create(http *gin.Context) {
 	type ParamsValidate struct {
-		docker.Client
+		types2.DockerEnv
 	}
 	params := ParamsValidate{}
 	if !self.Validate(http, &params) {
@@ -66,11 +109,30 @@ func (self Env) Create(http *gin.Context) {
 		return
 	}
 	if params.EnableTLS && (params.TlsCa == "" || params.TlsCert == "" || params.TlsKey == "") {
-		self.JsonResponseWithError(http, function.ErrorMessage(".systemEnvTlsInvalidCert"), 500)
+		self.JsonResponseWithError(http, function.ErrorMessage(define.ErrorMessageSystemEnvTlsInvalidCert), 500)
 		return
+	}
+	var oldDockerEnv *types2.DockerEnv
+	if v, err := (logic.Env{}).GetEnvByName(params.Name); err == nil {
+		oldDockerEnv = v
+		if params.SshServerInfo != nil {
+			if function.IsSensitivePlaceholder(params.SshServerInfo.Password) {
+				params.SshServerInfo.Password = oldDockerEnv.SshServerInfo.Password
+			}
+			if function.IsSensitivePlaceholder(params.SshServerInfo.PrivateKey) {
+				params.SshServerInfo.PrivateKey = oldDockerEnv.SshServerInfo.PrivateKey
+			}
+		}
+		if function.IsSensitivePlaceholder(params.TlsKey) {
+			params.TlsKey = oldDockerEnv.TlsKey
+		}
 	}
 
 	if params.EnableSSH {
+		knownHostsCallback := ssh.NewDefaultKnownHostCallback()
+		if params.SshServerInfo != nil && params.SshServerInfo.Address != "" {
+			_ = knownHostsCallback.Delete(params.SshServerInfo.Address, params.SshServerInfo.Port)
+		}
 		sshClient, err := ssh.NewClient(ssh.WithServerInfo(params.SshServerInfo)...)
 		if err != nil {
 			self.JsonResponseWithError(http, err, 500)
@@ -79,34 +141,33 @@ func (self Env) Create(http *gin.Context) {
 		defer func() {
 			sshClient.Close()
 		}()
-		result, _, err := sshClient.Run("pwd")
-		if err != nil {
-			self.JsonResponseWithError(http, err, 500)
-			return
+		// ssh 密码加密
+		if v, err := function.RSAEncode(params.SshServerInfo.Password); err == nil && params.SshServerInfo.Password != "" {
+			params.SshServerInfo.Password = v
 		}
-		slog.Debug("docker env", "ssh home", result)
+		// ssh 证书加密
+		if v, err := function.RSAEncode(params.SshServerInfo.PrivateKey); err == nil && params.SshServerInfo.PrivateKey != "" {
+			params.SshServerInfo.PrivateKey = v
+		}
 	}
 
 	defaultEnv := false
-	if params.Name == "local" {
+	if params.Name == define.DockerDefaultClientName {
 		defaultEnv = true
 	}
-	options := []docker.Option{
-		docker.WithAddress(params.Address),
-		docker.WithName(params.Name),
-	}
+
 	if params.EnableComposePath {
 		if params.ComposePath == "" {
 			params.ComposePath = fmt.Sprintf("compose-%s", params.Name)
 		}
 	}
-	_ = os.MkdirAll(filepath.Join(storage.Local{}.GetStorageLocalPath(), params.ComposePath), 0755)
-
-	if params.RemoteType == "ssh" {
-		options = append(options, docker.WithSSH(params.SshServerInfo))
+	composePath := function.SafePathJoin(storage.Local{}.GetStorageLocalPath(), params.ComposePath)
+	if relComposePath, err := filepath.Rel(storage.Local{}.GetStorageLocalPath(), composePath); err == nil {
+		params.ComposePath = relComposePath
 	}
+	_ = os.MkdirAll(composePath, 0755)
 
-	client := &docker.Client{
+	dockerEnv := &types2.DockerEnv{
 		Name:              params.Name,
 		Title:             params.Title,
 		Address:           params.Address,
@@ -121,93 +182,73 @@ func (self Env) Create(http *gin.Context) {
 		EnableSSH:         params.EnableSSH,
 		SshServerInfo:     params.SshServerInfo,
 		RemoteType:        params.RemoteType,
+		DockerType:        params.DockerType,
 	}
 
 	if params.EnableTLS {
-		if strings.HasSuffix(params.TlsCa, ".pem") {
-			options = append(options, docker.WithTLS(params.TlsCa, params.TlsCert, params.TlsKey))
-		} else {
-			certList := []struct {
-				name    string
-				content string
-			}{
-				{
-					name:    "ca.pem",
-					content: params.TlsCa,
-				},
-				{
-					name:    "cert.pem",
-					content: params.TlsCert,
-				},
-				{
-					name:    "key.pem",
-					content: params.TlsKey,
-				},
-			}
-			certRootPath := filepath.Join("docker", params.Name)
-			for _, s := range certList {
-				path := filepath.Join(storage.Local{}.GetStorageCertPath(), certRootPath, s.name)
-				err := os.MkdirAll(filepath.Dir(path), os.ModePerm)
-				if err != nil {
-					self.JsonResponseWithError(http, err, 500)
-					return
-				}
-				err = os.WriteFile(path, []byte(s.content), 0o600)
-				if err != nil {
-					self.JsonResponseWithError(http, err, 500)
-					return
-				}
-			}
-			client.TlsCa = filepath.Join(certRootPath, "ca.pem")
-			client.TlsCert = filepath.Join(certRootPath, "cert.pem")
-			client.TlsKey = filepath.Join(certRootPath, "key.pem")
-
-			options = append(options,
-				docker.WithTLS(
-					client.TlsCa,
-					client.TlsCert,
-					client.TlsKey,
-				),
-			)
+		certList := []struct {
+			name    string
+			content string
+		}{
+			{
+				name:    "ca.pem",
+				content: params.TlsCa,
+			},
+			{
+				name:    "cert.pem",
+				content: params.TlsCert,
+			},
+			{
+				name:    "key.pem",
+				content: params.TlsKey,
+			},
 		}
+		for _, s := range certList {
+			if s.content == "" || !strings.Contains(s.content, "-----BEGIN") {
+				continue
+			}
+			path := function.SafePathJoin(storage.Local{}.GetCertPath(), dockerEnv.CertRoot(), s.name)
+			err := os.MkdirAll(filepath.Dir(path), os.ModePerm)
+			if err != nil {
+				self.JsonResponseWithError(http, err, 500)
+				return
+			}
+			err = os.WriteFile(path, []byte(s.content), 0o600)
+			if err != nil {
+				self.JsonResponseWithError(http, err, 500)
+				return
+			}
+		}
+		dockerEnv.TlsCa = filepath.Join(dockerEnv.CertRoot(), "ca.pem")
+		dockerEnv.TlsCert = filepath.Join(dockerEnv.CertRoot(), "cert.pem")
+		dockerEnv.TlsKey = filepath.Join(dockerEnv.CertRoot(), "key.pem")
 	}
-	dockerClient, err := docker.NewBuilder(options...)
+
+	dockerClient, err := docker.NewClientWithDockerEnv(dockerEnv, docker.WithSockProxy())
 	if err != nil {
 		self.JsonResponseWithError(http, err, 500)
 		return
 	}
-	_, err = dockerClient.Client.Info(dockerClient.Ctx)
+	_, err = dockerClient.Client.Info(dockerClient.GetTryCtx())
 	if err != nil {
 		dockerClient.Close()
 		if function.ErrorHasKeyword(err, "Maximum supported") {
-			self.JsonResponseWithError(http, function.ErrorMessage(".systemEnvApiTooOld", "err", err.Error()), 500)
+			self.JsonResponseWithError(http, function.ErrorMessage(define.ErrorMessageSystemEnvApiTooOld, "err", err.Error()), 500)
 			return
 		}
-		self.JsonResponseWithError(http, function.ErrorMessage(".systemEnvDockerApiFailed", "error", err.Error()), 500)
+		self.JsonResponseWithError(http, function.ErrorMessage(define.ErrorMessageSystemEnvDockerApiFailed, "error", err.Error()), 500)
 		return
 	}
-	if defaultEnv {
-		// 获取面板信息
-		if info, err := dockerClient.Client.ContainerInspect(dockerClient.Ctx, facade.GetConfig().GetString("app.name")); err == nil {
-			_ = logic.Setting{}.Save(&entity.Setting{
-				GroupName: logic.SettingGroupSetting,
-				Name:      logic.SettingGroupSettingDPanelInfo,
-				Value: &accessor.SettingValueOption{
-					DPanelInfo: &info,
-				},
-			})
-		}
-		if defaultDockerInfo, err := dockerClient.Client.Info(dockerClient.Ctx); err == nil {
-			client.DockerInfo = &docker.ClientDockerInfo{
-				Name: defaultDockerInfo.Name,
-				ID:   defaultDockerInfo.ID,
-			}
-		}
-	}
+	logic.Env{}.UpdateEnv(dockerEnv)
 
-	logic.DockerEnv{}.UpdateEnv(client)
+	time.AfterFunc(1*time.Second, func() {
+		if newDockerEnv, err := (logic.Env{}).GetEnvByName(dockerEnv.Name); err == nil {
+			event2.Monitor.Join(newDockerEnv)
+		}
+	})
+
 	// 如果修改的是当前客户端的连接地址，则更新 docker sdk
-	if docker.Sdk.Name == params.Name && docker.Sdk.Client.DaemonHost() != params.Address {
+	if docker.Sdk.Name == params.Name {
 		docker.Sdk.Close()
 		docker.Sdk = dockerClient
 	} else {
@@ -226,56 +267,27 @@ func (self Env) Switch(http *gin.Context) {
 		return
 	}
 
-	dockerEnv, err := logic.DockerEnv{}.GetEnvByName(params.Name)
+	dockerEnv, err := logic.Env{}.GetEnvByName(params.Name)
 	if err != nil {
-		self.JsonResponseWithError(http, function.ErrorMessage(".commonDataNotFoundOrDeleted"), 500)
+		self.JsonResponseWithError(http, function.ErrorMessage(define.ErrorMessageCommonDataNotFoundOrDeleted), 500)
 		return
-	}
-	options := make([]docker.Option, 0)
-	if docker.Sdk.Client.DaemonHost() == dockerEnv.Address {
-		self.JsonSuccessResponse(http)
-		return
-	}
-	options = append(options, docker.WithAddress(dockerEnv.Address))
-	options = append(options, docker.WithName(dockerEnv.Name))
-	if dockerEnv.EnableTLS {
-		options = append(options, docker.WithTLS(dockerEnv.TlsCa, dockerEnv.TlsCert, dockerEnv.TlsKey))
-	}
-	if dockerEnv.RemoteType == docker.RemoteTypeSSH {
-		options = append(options, docker.WithSSH(dockerEnv.SshServerInfo))
 	}
 	oldDockerClient := docker.Sdk
-
-	dockerClient, err := docker.NewBuilder(options...)
+	dockerClient, err := docker.NewClientWithDockerEnv(dockerEnv, docker.WithSockProxy())
 	if err != nil {
 		self.JsonResponseWithError(http, err, 500)
 		return
 	}
-	_, err = dockerClient.Client.Info(dockerClient.Ctx)
+	_, err = dockerClient.Client.Info(dockerClient.GetTryCtx())
 	if err != nil {
-		self.JsonResponseWithError(http, function.ErrorMessage(".systemEnvDockerApiFailed", "error", err.Error()), 500)
+		self.JsonResponseWithError(http, function.ErrorMessage(define.ErrorMessageSystemEnvDockerApiFailed, "error", err.Error()), 500)
 		return
 	}
-	oldDockerClient.CtxCancelFunc()
-	_ = oldDockerClient.Client.Close()
-
-	docker.Sdk = dockerClient
-	if dockerEnv.RemoteType == docker.RemoteTypeDocker {
-		go logic.EventLogic{}.MonitorLoop()
-	}
-
-	// 清除掉统计数据
-	_ = logic.Setting{}.Save(&entity.Setting{
-		GroupName: logic.SettingGroupSetting,
-		Name:      logic.SettingGroupSettingDiskUsage,
-		Value: &accessor.SettingValueOption{
-			DiskUsage: &accessor.DiskUsage{
-				Usage:     &types.DiskUsage{},
-				UpdatedAt: time.Now(),
-			},
-		},
+	facade.Event.Publish(event.PluginDestroyExplorer, event.DockerDaemonPayload{
+		DockerEnvName: oldDockerClient.DockerEnv.Name,
 	})
-
+	oldDockerClient.Close()
+	docker.Sdk = dockerClient
 	self.JsonSuccessResponse(http)
 	return
 }
@@ -297,14 +309,16 @@ func (self Env) Delete(http *gin.Context) {
 
 	for _, name := range params.Name {
 		if row, ok := setting.Value.Docker[name]; !ok {
-			self.JsonResponseWithError(http, function.ErrorMessage(".commonDataNotFoundOrDeleted"), 500)
+			self.JsonResponseWithError(http, function.ErrorMessage(define.ErrorMessageCommonDataNotFoundOrDeleted), 500)
 			return
 		} else {
-			if docker.Sdk.Client.DaemonHost() == row.Address {
-				self.JsonResponseWithError(http, function.ErrorMessage(".systemEnvCurrentCanNotDelete"), 500)
+			if docker.Sdk.DockerEnv.Name == row.Name {
+				self.JsonResponseWithError(http, function.ErrorMessage(define.ErrorMessageSystemEnvCurrentCanNotDelete), 500)
 				return
 			}
 			delete(setting.Value.Docker, name)
+
+			event2.Monitor.Leave(name)
 
 			facade.GetEvent().Publish(event.EnvDeleteEvent, event.EnvPayload{
 				Name: name,
@@ -330,7 +344,7 @@ func (self Env) GetDetail(http *gin.Context) {
 		params.Name = docker.Sdk.Name
 	}
 
-	dockerEnv, err := logic.DockerEnv{}.GetEnvByName(params.Name)
+	dockerEnv, err := logic.Env{}.GetEnvByName(params.Name)
 	if err != nil {
 		self.JsonResponseWithError(http, err, 500)
 		return
@@ -343,6 +357,9 @@ func (self Env) GetDetail(http *gin.Context) {
 				dockerEnv.ServerUrl = b
 			}
 		}
+	}
+	if dockerEnv.EnableSSH && dockerEnv.Name != define.DockerDefaultClientName && dockerEnv.ServerUrl == "" {
+		dockerEnv.ServerUrl = dockerEnv.SshServerInfo.Address
 	}
 	if dockerEnv.ServerUrl == "" {
 		dockerEnv.ServerUrl = "127.0.0.1"

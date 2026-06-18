@@ -2,9 +2,10 @@ package accessor
 
 import (
 	"fmt"
-	"github.com/donknap/dpanel/common/service/docker"
-	"github.com/robfig/cron/v3"
 	"time"
+
+	"github.com/donknap/dpanel/common/service/docker/types"
+	"github.com/robfig/cron/v3"
 )
 
 const (
@@ -54,15 +55,25 @@ func (self CronSettingExpression) ToString() string {
 	return "0 0 0 * * *"
 }
 
+const (
+	CronTriggerTypeCron   = "cron"
+	CronTriggerTypeManual = "manual"
+	CronTriggerTypeEvent  = "event"
+)
+
 type CronSettingOption struct {
-	NextRunTime    []time.Time             `json:"nextRunTime,omitempty"`
-	Expression     []CronSettingExpression `json:"expression,omitempty"`
-	ContainerName  string                  `json:"containerName,omitempty"`
-	Script         string                  `json:"script,omitempty"`
-	JobIds         []cron.EntryID          `json:"jobIds,omitempty"`
-	Environment    []docker.EnvItem        `json:"environment,omitempty"`
-	EnableRunBlock bool                    `json:"enableRunBlock,omitempty"`
-	KeepLogTotal   int                     `json:"keepLogTotal,omitempty"`
-	Disable        bool                    `json:"disable,omitempty"`
-	DockerEnvName  string                  `json:"dockerEnvName,omitempty"`
+	NextRunTime      []time.Time             `json:"nextRunTime,omitempty"`
+	Expression       []CronSettingExpression `json:"expression,omitempty"`
+	ContainerName    string                  `json:"containerName,omitempty"`
+	Script           string                  `json:"script,omitempty"`
+	JobIds           []cron.EntryID          `json:"jobIds,omitempty"`
+	Environment      []types.EnvItem         `json:"environment,omitempty"`
+	EnableRunBlock   bool                    `json:"enableRunBlock,omitempty"`
+	KeepLogTotal     int                     `json:"keepLogTotal,omitempty"`
+	Disable          bool                    `json:"disable,omitempty"`
+	DockerEnvName    string                  `json:"dockerEnvName,omitempty"`
+	EntryShell       string                  `json:"entryShell,omitempty"`
+	ScriptRunTimeout int                     `json:"scriptRunTimeout,omitempty"`
+	TriggerType      string                  `json:"triggerType,omitempty" binding:"oneof=cron event manual"`
+	EventType        string                  `json:"eventType,omitempty"`
 }

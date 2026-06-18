@@ -3,33 +3,39 @@ package controller
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/docker/docker/api/types"
+	"io"
+	"log/slog"
+	http2 "net/http"
+	"os"
+	"path/filepath"
+	"runtime"
+	"sort"
+	"strings"
+	"time"
+
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/client"
 	"github.com/docker/go-units"
 	"github.com/donknap/dpanel/app/application/logic"
-	"github.com/donknap/dpanel/common/accessor"
-	"github.com/donknap/dpanel/common/dao"
-	"github.com/donknap/dpanel/common/entity"
+	logic2 "github.com/donknap/dpanel/app/common/logic"
 	"github.com/donknap/dpanel/common/function"
 	"github.com/donknap/dpanel/common/service/docker"
+	"github.com/donknap/dpanel/common/service/docker/types"
 	"github.com/donknap/dpanel/common/service/notice"
-	"github.com/donknap/dpanel/common/service/registry"
 	"github.com/donknap/dpanel/common/service/storage"
 	"github.com/donknap/dpanel/common/service/ws"
+	"github.com/donknap/dpanel/common/types/define"
 	"github.com/gin-gonic/gin"
+	"github.com/mholt/archives"
+	"github.com/patrickmn/go-cache"
+	"github.com/we7coreteam/registry-go-sdk"
 	"github.com/we7coreteam/w7-rangine-go/v2/src/http/controller"
-	"io"
-	"log/slog"
-	http2 "net/http"
-	"os"
-	"strings"
-	"time"
 )
 
 type Image struct {
@@ -38,38 +44,49 @@ type Image struct {
 
 func (self Image) ImportByContainerTar(http *gin.Context) {
 	type ParamsValidate struct {
-		Tar      string   `json:"tar" binding:"required"`
-		Tag      string   `json:"tag" binding:"required"`
-		Registry string   `json:"registry"`
-		Cmd      string   `json:"cmd" binding:"required"`
-		WorkDir  string   `json:"workDir"`
-		Expose   []string `json:"expose"`
-		Env      []string `json:"env"`
-		Volume   []string `json:"volume"`
+		Tar        string          `json:"tar" binding:"required"`
+		Tag        []*function.Tag `json:"tag" binding:"required"`
+		Registry   string          `json:"registry"`
+		Cmd        string          `json:"cmd"`
+		Entrypoint string          `json:"entrypoint"`
+		WorkDir    string          `json:"workDir"`
+		User       string          `json:"user"`
+		Expose     []string        `json:"expose"`
+		Env        []string        `json:"env"`
+		Volume     []string        `json:"volume"`
 	}
 	params := ParamsValidate{}
 	if !self.Validate(http, &params) {
 		return
 	}
-	imageNameDetail := registry.GetImageTagDetail(params.Tag)
-	if params.Registry != "" {
-		imageNameDetail.Registry = params.Registry
+	tag := params.Tag[0].Name
+	if params.Tag[0].Registry != "" {
+		tag = params.Tag[0].Registry + "/" + tag
 	}
+	imageNameDetail := function.ImageTag(tag)
 	imageInfo, err := docker.Sdk.Client.ImageInspect(docker.Sdk.Ctx, imageNameDetail.Uri())
 	if err == nil && imageInfo.ID != "" {
-		self.JsonResponseWithError(http, function.ErrorMessage(".commonIdAlreadyExists", "name", imageNameDetail.Uri()), 500)
+		self.JsonResponseWithError(http, function.ErrorMessage(define.ErrorMessageCommonIdAlreadyExists, "name", imageNameDetail.Uri()), 500)
 		return
 	}
-	containerTar, err := os.Open(storage.Local{}.GetRealPath(params.Tar))
+	containerTar, err := os.Open(storage.Local{}.GetSaveRealPath(params.Tar))
 	if err != nil {
 		self.JsonResponseWithError(http, err, 500)
 		return
 	}
-	change := []string{
-		"CMD " + params.Cmd,
+	defer containerTar.Close()
+	change := make([]string, 0)
+	if params.Cmd != "" {
+		change = append(change, "CMD "+params.Cmd)
+	}
+	if params.Entrypoint != "" {
+		change = append(change, "ENTRYPOINT "+params.Entrypoint)
 	}
 	if params.WorkDir != "" {
 		change = append(change, "WORKDIR "+params.WorkDir)
+	}
+	if params.User != "" {
+		change = append(change, "USER "+params.User)
 	}
 	for _, port := range params.Expose {
 		change = append(change, "EXPOSE "+port)
@@ -97,7 +114,7 @@ func (self Image) ImportByContainerTar(http *gin.Context) {
 		self.JsonResponseWithError(http, err, 500)
 		return
 	}
-	_ = os.Remove(storage.Local{}.GetRealPath(params.Tar))
+	_ = os.Remove(storage.Local{}.GetSaveRealPath(params.Tar))
 	self.JsonSuccessResponse(http)
 	return
 }
@@ -125,7 +142,7 @@ func (self Image) ImportByImageTar(http *gin.Context) {
 			if err == io.EOF {
 				break
 			}
-			msg := docker.BuildMessage{}
+			msg := types.BuildMessage{}
 			if err = json.Unmarshal(line, &msg); err == nil {
 				if msg.Stream != "" && strings.Contains(msg.Stream, "Loaded image:") {
 					if _, after, exists := strings.Cut(msg.Stream, "Loaded image: "); exists {
@@ -174,20 +191,41 @@ func (self Image) ImportByImageTar(http *gin.Context) {
 
 	if !function.IsEmptyArray(params.LocalUrl) {
 		for _, s := range params.LocalUrl {
-			tarPathList = append(tarPathList, storage.Local{}.GetRealPath(s))
+			tarPathList = append(tarPathList, storage.Local{}.GetSaveRealPath(s))
 		}
 	}
 
 	for _, s := range tarPathList {
 		err := func() error {
-			imageTar, err := os.Open(s)
-			if err != nil {
-				return err
+			var imageStreamFile *os.File
+			mimeType, err := docker.Sdk.OciMimeType(docker.Sdk.Ctx, s)
+			// 因为 windows 调用 oci 库的时候会报路径错误，包含了冒号（：）所以这里如果是 windows 则回退到 docker 逻辑上
+			if runtime.GOOS != "windows" && err == nil && strings.Contains(mimeType, "application/vnd.oci") {
+				imageStreamFile, err = docker.Sdk.OciToDockerTar(docker.Sdk.Ctx, s)
+				if errors.Is(err, docker.ErrOciArchiveNotSplittable) {
+					slog.Debug("oci image import fallback docker load", "reason", err.Error())
+					imageStreamFile, err = os.Open(s)
+					if err != nil {
+						return err
+					}
+				} else if err != nil {
+					return err
+				}
+			} else {
+				imageStreamFile, err = os.Open(s)
+				if err != nil {
+					return err
+				}
 			}
+
 			defer func() {
-				_ = os.Remove(imageTar.Name())
+				if imageStreamFile != nil {
+					_ = imageStreamFile.Close()
+					_ = os.Remove(imageStreamFile.Name())
+				}
 			}()
-			response, err := docker.Sdk.Client.ImageLoad(docker.Sdk.Ctx, imageTar, client.ImageLoadWithQuiet(false))
+
+			response, err := docker.Sdk.Client.ImageLoad(docker.Sdk.Ctx, imageStreamFile, client.ImageLoadWithQuiet(false))
 			if err != nil {
 				return err
 			}
@@ -205,107 +243,27 @@ func (self Image) ImportByImageTar(http *gin.Context) {
 		}
 	}
 
-	notice.Message{}.Info(".imageImport", "name", strings.Join(importImageTag, ", "))
+	_ = notice.Message{}.Info(".imageImport", "name", strings.Join(importImageTag, ", "))
 	self.JsonResponseWithoutError(http, gin.H{
 		"tag": importImageTag,
 	})
 	return
 }
 
-func (self Image) CreateByDockerfile(http *gin.Context) {
-	params := logic.BuildImageOption{}
-	if !self.Validate(http, &params) {
-		return
-	}
-	if params.BuildDockerfileContent == "" && params.BuildZip == "" && params.BuildGit == "" {
-		self.JsonResponseWithError(http, function.ErrorMessage(".imageBuildTypeEmpty"), 500)
-		return
-	}
-	if params.BuildZip != "" && params.BuildGit != "" {
-		self.JsonResponseWithError(http, function.ErrorMessage(".imageBuildTypeConflict"), 500)
-		return
-	}
-	imageNameDetail := registry.GetImageTagDetail(params.Tag)
-	if params.Registry != "" {
-		imageNameDetail.Registry = params.Registry
-	}
-	params.Tag = imageNameDetail.Uri()
-
-	if params.BuildZip != "" {
-		path := storage.Local{}.GetRealPath(params.BuildZip)
-		_, err := os.Stat(path)
-		if os.IsNotExist(err) {
-			self.JsonResponseWithError(http, function.ErrorMessage(".commonUploadFileEmpty"), 500)
-			return
-		}
-		params.BuildZip = path
-	}
-
-	imageNew := &entity.Image{
-		Tag:   imageNameDetail.Uri(),
-		Title: params.Title,
-		Setting: &accessor.ImageSettingOption{
-			Registry:            params.Registry,
-			BuildGit:            params.BuildGit,
-			BuildDockerfile:     params.BuildDockerfileContent,
-			BuildRoot:           params.BuildDockerfileRoot,
-			BuildDockerfileName: params.BuildDockerfileName,
-			BuildArgs:           params.BuildArgs,
-			Platform:            &params.Platform,
-		},
-		BuildType: params.BuildType,
-		Status:    docker.ImageBuildStatusStop,
-		Message:   "",
-	}
-	if imageRow, _ := dao.Image.Where(dao.Image.ID.Eq(params.Id)).First(); imageRow != nil {
-		imageNew.ID = imageRow.ID
-	}
-	_ = dao.Image.Save(imageNew)
-
-	params.MessageId = fmt.Sprintf(ws.MessageTypeImageBuild, imageNew.ID)
-	log, err := logic.DockerTask{}.ImageBuild(&params)
-	if err != nil {
-		imageNew.Status = docker.ImageBuildStatusError
-		imageNew.Message = log + "\n" + err.Error()
-		_ = dao.Image.Save(imageNew)
-		self.JsonResponseWithError(http, err, 500)
-		return
-	}
-	imageNew.Status = docker.ImageBuildStatusSuccess
-	imageNew.Message = log
-	imageNew.ImageInfo = &accessor.ImageInfoOption{
-		Id: imageNameDetail.Uri(),
-	}
-	_ = dao.Image.Save(imageNew)
-	self.JsonResponseWithoutError(http, gin.H{
-		"imageId": imageNew.ID,
-	})
-	return
-}
-
 func (self Image) GetList(http *gin.Context) {
 	type ParamsValidate struct {
-		Tag   string `form:"tag" binding:"omitempty"`
-		Title string `json:"title"`
-		Use   int    `json:"use"`
+		Tag string `json:"tag" binding:"omitempty"`
+		Use int    `json:"use"`
 	}
 	params := ParamsValidate{}
 	if !self.Validate(http, &params) {
 		return
 	}
 
-	var filterTagList []string
-	if params.Title != "" {
-		_ = dao.Image.Where(dao.Image.Title.Like("%"+params.Title+"%")).Pluck(dao.Image.Tag, &filterTagList)
-	}
-	if params.Tag != "" {
-		filterTagList = append(filterTagList, params.Tag)
-	}
-
 	var result []image.Summary
 	imageList, err := docker.Sdk.Client.ImageList(docker.Sdk.Ctx, image.ListOptions{
-		All:            false,
-		ContainerCount: true,
+		All:       false,
+		Manifests: true,
 	})
 	if err != nil {
 		self.JsonResponseWithError(http, err, 500)
@@ -343,22 +301,18 @@ func (self Image) GetList(http *gin.Context) {
 		}
 	}
 
-	if !function.IsEmptyArray(filterTagList) {
-		for _, summary := range imageList {
-			for _, tag := range summary.RepoTags {
-				has := false
-				for _, s := range filterTagList {
-					if strings.Contains(tag, s) {
-						has = true
-						result = append(result, summary)
-						break
-					}
-				}
-				if has {
-					break
+	if params.Tag != "" {
+		result = function.PluckArrayWalk(imageList, func(item image.Summary) (image.Summary, bool) {
+			for _, tag := range item.RepoTags {
+				if strings.Contains(tag, params.Tag) {
+					return item, true
 				}
 			}
-		}
+			if strings.Contains(item.ID, params.Tag) {
+				return item, true
+			}
+			return item, false
+		})
 	} else {
 		result = imageList
 	}
@@ -375,16 +329,8 @@ func (self Image) GetList(http *gin.Context) {
 		})
 	}
 
-	titleList := make(map[string]string)
-	imageDbList, err := dao.Image.Find()
-	if err == nil {
-		for _, item := range imageDbList {
-			titleList[item.Tag] = item.Title
-		}
-	}
 	self.JsonResponseWithoutError(http, gin.H{
-		"list":  result,
-		"title": titleList,
+		"list": result,
 	})
 	return
 }
@@ -422,10 +368,9 @@ func (self Image) GetDetail(http *gin.Context) {
 	return
 }
 
-func (self Image) ImageDelete(http *gin.Context) {
+func (self Image) Delete(http *gin.Context) {
 	type ParamsValidate struct {
-		Md5   []string `json:"md5" binding:"required"`
-		Force bool     `json:"force"`
+		Md5 []string `json:"md5" binding:"required"`
 	}
 	params := ParamsValidate{}
 	if !self.Validate(http, &params) {
@@ -434,9 +379,24 @@ func (self Image) ImageDelete(http *gin.Context) {
 
 	if !function.IsEmptyArray(params.Md5) {
 		for _, sha := range params.Md5 {
-			_, err := docker.Sdk.Client.ImageRemove(docker.Sdk.Ctx, sha, image.RemoveOptions{
+			imageInfo, err := docker.Sdk.Client.ImageInspect(docker.Sdk.Ctx, sha)
+			if err != nil {
+				self.JsonResponseWithError(http, err, 500)
+				return
+			}
+			force := false
+			// 如果镜像没有被使用，包含之个 tag 时需要增加 force 参数
+			if len(imageInfo.RepoTags) > 1 {
+				if list, err := docker.Sdk.Client.ContainerList(docker.Sdk.Ctx, container.ListOptions{
+					All:     true,
+					Filters: filters.NewArgs(filters.Arg("ancestor", sha)),
+				}); err == nil && len(list) == 0 {
+					force = true
+				}
+			}
+			_, err = docker.Sdk.Client.ImageRemove(docker.Sdk.Ctx, sha, image.RemoveOptions{
 				PruneChildren: true,
-				Force:         true,
+				Force:         force,
 			})
 			if err != nil {
 				self.JsonResponseWithError(http, err, 500)
@@ -448,105 +408,141 @@ func (self Image) ImageDelete(http *gin.Context) {
 	return
 }
 
-func (self Image) ImagePrune(http *gin.Context) {
-	filter := filters.NewArgs()
-	filter.Add("dangling", "0")
-	res, err := docker.Sdk.Client.ImagesPrune(docker.Sdk.Ctx, filter)
-	if err != nil {
-		self.JsonResponseWithError(http, err, 500)
+func (self Image) Prune(http *gin.Context) {
+	type ParamsValidate struct {
+		EnableUnuseTag bool `json:"enableUnuseTag"`
+	}
+	params := ParamsValidate{}
+	if !self.Validate(http, &params) {
 		return
 	}
-	_ = notice.Message{}.Info(".imagePrune", "size", units.HumanSize(float64(res.SpaceReclaimed)), "count", fmt.Sprintf("%d", len(res.ImagesDeleted)))
-	self.JsonSuccessResponse(http)
-	return
-}
-
-func (self Image) BuildPrune(http *gin.Context) {
-	res, err := docker.Sdk.Client.BuildCachePrune(docker.Sdk.Ctx, types.BuildCachePruneOptions{
-		All: true,
-	})
-	if err != nil {
-		self.JsonResponseWithError(http, err, 500)
-		return
+	// 清理未使用的 tag 时，直接调用 Prune 处理
+	// 只清理未使用镜像时，需要手动删除，避免 tag 被删除
+	if params.EnableUnuseTag {
+		filter := filters.NewArgs()
+		filter.Add("dangling", "0")
+		res, err := docker.Sdk.Client.ImagesPrune(docker.Sdk.Ctx, filter)
+		if err != nil {
+			self.JsonResponseWithError(http, err, 500)
+			return
+		}
+		_ = notice.Message{}.Info(".imagePrune", "size", units.HumanSize(float64(res.SpaceReclaimed)), "count", fmt.Sprintf("%d", len(res.ImagesDeleted)))
+	} else {
+		var deleteImageSpaceReclaimed int64 = 0
+		deleteImageTotal := 0
+		useImageList := make([]string, 0)
+		if containerList, err := docker.Sdk.Client.ContainerList(docker.Sdk.Ctx, container.ListOptions{
+			All: true,
+		}); err == nil {
+			useImageList = function.PluckArrayWalk(containerList, func(item container.Summary) (string, bool) {
+				return item.ImageID, true
+			})
+		}
+		if imageList, err := docker.Sdk.Client.ImageList(docker.Sdk.Ctx, image.ListOptions{
+			All: true,
+		}); err == nil {
+			for _, item := range imageList {
+				if !function.InArray(useImageList, item.ID) {
+					deleteImageSpaceReclaimed += item.Size
+					deleteImageTotal += 1
+					// 当 tag 没有的时候把 id 也附加上
+					item.RepoTags = append(item.RepoTags, item.ID)
+					for _, tag := range item.RepoTags {
+						_, err = docker.Sdk.Client.ImageRemove(docker.Sdk.Ctx, tag, image.RemoveOptions{
+							PruneChildren: true,
+						})
+						if err != nil {
+							slog.Debug("image prune image remove", "error", err)
+						}
+					}
+				}
+			}
+		}
+		_ = notice.Message{}.Info(".imagePrune", "size", units.HumanSize(float64(deleteImageSpaceReclaimed)), "count", fmt.Sprintf("%d", deleteImageTotal))
 	}
-	_ = notice.Message{}.Info(".imageBuildPrune", "size", units.HumanSize(float64(res.SpaceReclaimed)))
 	self.JsonSuccessResponse(http)
 	return
 }
 
 func (self Image) Export(http *gin.Context) {
 	type ParamsValidate struct {
-		Md5                []string `json:"md5" binding:"required"`
-		EnableExportToPath bool     `json:"enableExportToPath"`
+		Md5                  []string `json:"md5" binding:"required"`
+		EnableExportToPath   bool     `json:"enableExportToPath"` // 开启后只存储到服务路径，不通过浏览器下载
+		EnableExportCompress bool     `json:"enableExportCompress"`
 	}
 	params := ParamsValidate{}
 	if !self.Validate(http, &params) {
 		return
 	}
-	out, err := docker.Sdk.Client.ImageSave(docker.Sdk.Ctx, params.Md5)
+
+	sort.Strings(params.Md5)
+	fileName := fmt.Sprintf("%s-%s.tar", strings.Join(function.PluckArrayWalk(params.Md5, func(i string) (string, bool) {
+		imageDetail := function.ImageTag(i)
+		return strings.ReplaceAll(imageDetail.ImageName, "-", "_"), true
+	}), "-"), time.Now().Format(define.DateYmdHis))
+
+	if params.EnableExportCompress {
+		fileName += ".gz"
+	}
+
+	ctx, cancel := context.WithCancel(docker.Sdk.Ctx)
+	defer cancel()
+
+	out, err := docker.Sdk.Client.ImageSave(ctx, params.Md5)
 	if err != nil {
 		self.JsonResponseWithError(http, err, 500)
 		return
 	}
 	defer func() {
-		err = out.Close()
-		if err != nil {
-			slog.Debug("image export close", "error", err)
-		}
+		_ = out.Close()
 	}()
 
-	var writer io.Writer
-	var file *os.File
+	exportSaveFile, err := storage.Local{}.CreateSaveFile(filepath.Join("export", "image", fileName))
+	if err != nil {
+		self.JsonResponseWithError(http, err, 500)
+		return
+	}
+	defer func() {
+		_ = exportSaveFile.Close()
+	}()
 
-	if params.EnableExportToPath {
-		names := function.PluckArrayWalk(params.Md5, func(i string) (string, bool) {
-			imageDetail := registry.GetImageTagDetail(i)
-			return strings.ReplaceAll(strings.ReplaceAll(imageDetail.BaseName, "-", "_"), "/", "_"), true
-		})
-		file, err = storage.Local{}.CreateTempFile(fmt.Sprintf("export/image/%s-%s.tar", strings.Join(names, "-"), time.Now().Format(function.YmdHis)))
+	if params.EnableExportCompress {
+		// 由于 zstd 是从 20 版本后才支持这里为了兼容还是保持 gz
+		compression := archives.Gz{}
+		cw, err := compression.OpenWriter(exportSaveFile)
 		if err != nil {
 			self.JsonResponseWithError(http, err, 500)
 			return
 		}
 		defer func() {
-			_ = file.Close()
+			_ = cw.Close()
 		}()
-		writer = file
-		_ = notice.Message{}.Info(".imageExportInPath", "path", file.Name())
+		_, err = io.Copy(cw, out)
 	} else {
-		writer = http.Writer
+		_, err = io.Copy(exportSaveFile, out)
 	}
-	_, err = io.Copy(writer, out)
+
 	if err != nil {
 		self.JsonResponseWithError(http, err, 500)
 		return
 	}
-	self.JsonSuccessResponse(http)
-	return
-}
 
-func (self Image) UpdateTitle(http *gin.Context) {
-	type ParamsValidate struct {
-		Tag   string `json:"tag" binding:"required"`
-		Title string `json:"title" binding:"required"`
-	}
-	params := ParamsValidate{}
-	if !self.Validate(http, &params) {
+	if params.EnableExportToPath {
+		self.JsonResponseWithoutError(http, gin.H{
+			"saveUrl": exportSaveFile.Name(),
+		})
 		return
 	}
-	imageBuildRow, _ := dao.Image.Where(dao.Image.Tag.Eq(params.Tag)).First()
-	if imageBuildRow != nil {
-		dao.Image.Where(dao.Image.Tag.Eq(params.Tag)).Updates(&entity.Image{
-			Title: params.Title,
-		})
-	} else {
-		_ = dao.Image.Create(&entity.Image{
-			Title:     params.Title,
-			Tag:       params.Tag,
-			BuildType: "pull",
-		})
+
+	downloadUrl, err := logic2.Attach{}.PreDownload(exportSaveFile.Name(), cache.DefaultExpiration)
+	if err != nil {
+		self.JsonResponseWithError(http, err, 500)
+		return
 	}
-	self.JsonSuccessResponse(http)
+	self.JsonResponseWithoutError(http, gin.H{
+		"saveUrl":     exportSaveFile.Name(),
+		"downloadUrl": downloadUrl,
+	})
 	return
 }
 
@@ -561,56 +557,50 @@ func (self Image) CheckUpgrade(http *gin.Context) {
 		return
 	}
 	imageInfo, err := docker.Sdk.Client.ImageInspect(docker.Sdk.Ctx, params.Md5)
-	if err != nil {
-		self.JsonResponseWithError(http, err, 500)
-		return
-	}
 	// 如果本地 digest 为空，则不检测
-	if function.IsEmptyArray(imageInfo.RepoDigests) {
-		_ = notice.Message{}.Info(".imageCheckUpgradeImageNotDigest")
+	if err != nil || function.IsEmptyArray(imageInfo.RepoDigests) {
 		self.JsonResponseWithoutError(http, gin.H{
 			"upgrade":     false,
 			"digest":      "",
 			"digestLocal": imageInfo.RepoDigests,
+			"error":       err,
 		})
 		return
 	}
 
-	digest := ""
-	upgrade := false
-
-	imageNameDetail := registry.GetImageTagDetail(params.Tag)
-	registryConfig := logic.Image{}.GetRegistryConfig(imageNameDetail.Uri())
-
-	for _, s := range registryConfig.Proxy {
-		option := make([]registry.Option, 0)
-		if params.CacheTime > 0 {
-			option = append(option, registry.WithRequestCacheTime(time.Second*time.Duration(params.CacheTime)))
-		}
-		option = append(option, registry.WithCredentialsString(registryConfig.GetRegistryAuthString()))
-		option = append(option, registry.WithRegistryHost(s))
-		reg := registry.New(option...)
-		if digest, err = reg.Repository.GetImageDigest(params.Tag); err == nil {
-			slog.Debug("image check upgrade", "remote digest", fmt.Sprintf("%s@%s", params.Tag, digest), "local digest", imageInfo.RepoDigests)
-			if !function.InArrayWalk(imageInfo.RepoDigests, func(i string) bool {
-				return strings.HasSuffix(i, digest)
-			}) {
-				upgrade = true
-			}
-			break
-		} else {
-			slog.Debug("image check upgrade", "err", err.Error())
+	if params.CacheTime > 0 {
+		if v, ok := storage.Cache.Get(fmt.Sprintf(storage.CacheKeyImageDigest, params.Md5)); ok {
+			self.JsonResponseWithoutError(http, v)
+			return
 		}
 	}
+
 	result := gin.H{
-		"upgrade":     upgrade,
-		"digest":      digest,
+		"upgrade":     false,
+		"digest":      "",
 		"digestLocal": imageInfo.RepoDigests,
 		"error":       "",
 	}
-	if err != nil {
+
+	imageNameDetail := function.ImageTag(params.Tag)
+	registryConfig := logic.Image{}.GetRegistryConfig(imageNameDetail.Registry)
+
+	option := make([]registry.Option, 0)
+	option = append(option, registry.WithCredentials(registryConfig.Credential()))
+	option = append(option, registry.WithAddress(registryConfig.Address...))
+	reg := registry.New(option...)
+	if ok, desc, err := reg.Client().ManifestExist(imageNameDetail.BaseName, imageNameDetail.Version); err == nil && ok {
+		result["digest"] = desc.Digest.String()
+		if !function.InArrayWalk(imageInfo.RepoDigests, func(i string) bool {
+			return strings.HasSuffix(i, desc.Digest.String())
+		}) {
+			result["upgrade"] = true
+		}
+	} else if err != nil {
 		result["error"] = err.Error()
 	}
+	slog.Info("image check upgrade", "result", result)
+	storage.Cache.Set(fmt.Sprintf(storage.CacheKeyImageDigest, params.Md5), result, time.Duration(params.CacheTime)*time.Second)
 	self.JsonResponseWithoutError(http, result)
 	return
 }

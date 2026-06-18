@@ -19,9 +19,19 @@ func WithProxyContainer(name string) Option {
 	}
 }
 
-func WithDockerSdk(sdk *docker.Builder) Option {
+func WithDockerSdk(sdk *docker.Client) Option {
 	return func(self *Fs) error {
 		self.sdk = sdk
+		return nil
+	}
+}
+
+func WithWorkingDir(workingDir string) Option {
+	return func(self *Fs) error {
+		if workingDir == "" {
+			workingDir = "/"
+		}
+		self.workingDir = workingDir
 		return nil
 	}
 }

@@ -2,13 +2,27 @@ package ssh
 
 import (
 	"errors"
-	"golang.org/x/crypto/ssh"
-	"golang.org/x/crypto/ssh/knownhosts"
+	"fmt"
 	"net"
 	"os"
+	"path/filepath"
+
+	"github.com/donknap/dpanel/common/service/exec/local"
+	"golang.org/x/crypto/ssh"
+	"golang.org/x/crypto/ssh/knownhosts"
 )
 
 var keyErr *knownhosts.KeyError
+
+func NewDefaultKnownHostCallback() *DefaultKnownHostsCallback {
+	path := ""
+	if v, err := os.UserHomeDir(); err == nil {
+		path = filepath.Join(v, ".ssh", "known_hosts")
+	}
+	return &DefaultKnownHostsCallback{
+		path: path,
+	}
+}
 
 type DefaultKnownHostsCallback struct {
 	path string
@@ -72,5 +86,16 @@ func (self DefaultKnownHostsCallback) add(hostname string, remote net.Addr, key 
 		addresses = append(addresses, hostNormalized)
 	}
 	_, err = f.WriteString(knownhosts.Line(addresses, key) + "\n")
+	return err
+}
+
+func (self DefaultKnownHostsCallback) Delete(address string, port int) error {
+	host := ""
+	if port == 22 {
+		host = address
+	} else {
+		host = fmt.Sprintf("[%s]:%d", address, port)
+	}
+	_, err := local.QuickRun(fmt.Sprintf(`ssh-keygen -R "%s"`, host))
 	return err
 }

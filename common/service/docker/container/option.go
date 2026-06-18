@@ -3,6 +3,12 @@ package container
 import (
 	"errors"
 	"fmt"
+	"io"
+	"net"
+	"os"
+	"strings"
+	"time"
+
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/api/types/network"
@@ -10,10 +16,7 @@ import (
 	"github.com/docker/go-units"
 	"github.com/donknap/dpanel/common/function"
 	"github.com/donknap/dpanel/common/service/docker"
-	"io"
-	"os"
-	"strings"
-	"time"
+	"github.com/donknap/dpanel/common/service/docker/types"
 )
 
 type Option func(builder *Builder) error
@@ -22,6 +25,8 @@ func WithContainerInfo(containerInfo container.InspectResponse) Option {
 	return func(self *Builder) error {
 		self.containerConfig = containerInfo.Config
 		self.hostConfig = containerInfo.HostConfig
+		// compatible cgroup v2 不支持配置 MemorySwappiness，podman 在 crun 下会严格报错
+		self.hostConfig.MemorySwappiness = nil
 		return nil
 	}
 }
@@ -29,13 +34,19 @@ func WithContainerInfo(containerInfo container.InspectResponse) Option {
 func WithContainerName(name string) Option {
 	return func(self *Builder) error {
 		self.containerConfig.Hostname = name
-		self.containerConfig.Domainname = "pod.dpanel.local"
 		self.containerName = name
+		// 恢复一些默认值
+		self.hostConfig.NetworkMode = network.NetworkDefault
+		self.hostConfig.PidMode = ""
+		self.hostConfig.ExtraHosts = []string{
+			"host.dpanel.local:host-gateway",
+		}
+
 		//  防止退出
 		self.containerConfig.AttachStdin = true
 		self.containerConfig.AttachStdout = true
 		self.containerConfig.AttachStderr = true
-		self.containerConfig.Tty = true
+		self.containerConfig.OpenStdin = true
 		return nil
 	}
 }
@@ -56,9 +67,9 @@ func WithDomainName(name string) Option {
 	}
 }
 
-func WithEnv(item ...docker.EnvItem) Option {
+func WithEnv(item ...types.EnvItem) Option {
 	return func(self *Builder) error {
-		self.containerConfig.Env = function.PluckArrayWalk(item, func(i docker.EnvItem) (string, bool) {
+		self.containerConfig.Env = function.PluckArrayWalk(item, func(i types.EnvItem) (string, bool) {
 			if i.Name == "" {
 				return "", false
 			}
@@ -89,13 +100,16 @@ func WithImage(imageName string, tryPullImage bool) Option {
 	}
 }
 
-func WithRestartPolicy(restartPolicy string) Option {
+func WithRestartPolicy(restartPolicy *types.RestartPolicy) Option {
 	return func(self *Builder) error {
-		if restartPolicy == "" {
-			restartPolicy = "no"
+		if restartPolicy.Name == "" {
+			restartPolicy.Name = "no"
 		}
 		self.hostConfig.RestartPolicy = container.RestartPolicy{}
-		self.hostConfig.RestartPolicy.Name = docker.GetRestartPolicyByString(restartPolicy)
+		self.hostConfig.RestartPolicy.Name = function.ParseRestartPolicy(restartPolicy.Name)
+		if self.hostConfig.RestartPolicy.Name == container.RestartPolicyOnFailure {
+			self.hostConfig.RestartPolicy.MaximumRetryCount = restartPolicy.MaxAttempt
+		}
 		return nil
 	}
 }
@@ -107,7 +121,7 @@ func WithPrivileged(b bool) Option {
 	}
 }
 
-func WithVolume(item ...docker.VolumeItem) Option {
+func WithVolume(item ...types.VolumeItem) Option {
 	return func(self *Builder) error {
 		self.hostConfig.Binds = make([]string, 0)
 
@@ -120,9 +134,9 @@ func WithVolume(item ...docker.VolumeItem) Option {
 				permission = "ro"
 			}
 			bind := fmt.Sprintf("%s:%s:%s", volumeItem.Host, volumeItem.Dest, permission)
-			if exists, index := function.IndexArrayWalk(self.hostConfig.Binds, func(i string) bool {
+			if index, ok := function.IndexArrayWalk(self.hostConfig.Binds, func(i string) bool {
 				return strings.Contains(i, ":"+volumeItem.Dest+":")
-			}); exists {
+			}); ok {
 				self.hostConfig.Binds[index] = bind
 			} else {
 				self.hostConfig.Binds = append(self.hostConfig.Binds, bind)
@@ -132,7 +146,7 @@ func WithVolume(item ...docker.VolumeItem) Option {
 	}
 }
 
-func WithVolumesFrom(item ...docker.LinkItem) Option {
+func WithVolumesFrom(item ...types.LinkItem) Option {
 	containerList := make([]string, 0)
 	for _, linkItem := range item {
 		if linkItem.Volume {
@@ -156,7 +170,7 @@ func WithVolumesFromContainerName(item ...string) Option {
 	}
 }
 
-func WithPort(item ...docker.PortItem) Option {
+func WithPort(item ...types.PortItem) Option {
 	return func(self *Builder) error {
 		self.containerConfig.ExposedPorts = make(nat.PortSet)
 		self.hostConfig.PortBindings = make(nat.PortMap)
@@ -185,7 +199,7 @@ func WithPublishAllPorts(b bool) Option {
 	}
 }
 
-func WithLink(item ...docker.LinkItem) Option {
+func WithLink(item ...types.LinkItem) Option {
 	return func(self *Builder) error {
 		for _, linkItem := range item {
 			if linkItem.Alise == "" {
@@ -207,7 +221,7 @@ func WithLink(item ...docker.LinkItem) Option {
 }
 
 // WithNetwork 不在构建时加入网络，会导致 bridge 网络无法加入
-func WithNetwork(item ...docker.NetworkItem) Option {
+func WithNetwork(item ...types.NetworkItem) Option {
 	return func(self *Builder) error {
 		if self.networkingConfig == nil {
 			self.networkingConfig = &network.NetworkingConfig{
@@ -288,21 +302,19 @@ func WithWorkDir(path string) Option {
 
 func WithUser(user string) Option {
 	return func(self *Builder) error {
-		if user == "" {
-			return nil
-		}
 		self.containerConfig.User = user
 		return nil
 	}
 }
 
 func WithCommandStr(cmd string) Option {
-	return WithCommand(docker.CommandSplit(cmd))
+	return WithCommand(function.SplitCommandArray(cmd))
 }
 
 func WithCommand(cmd []string) Option {
 	return func(self *Builder) error {
 		if cmd == nil || len(cmd) == 0 {
+			self.containerConfig.Cmd = nil
 			return nil
 		}
 		self.containerConfig.Cmd = cmd
@@ -311,12 +323,13 @@ func WithCommand(cmd []string) Option {
 }
 
 func WithEntrypointStr(cmd string) Option {
-	return WithEntrypoint(docker.CommandSplit(cmd))
+	return WithEntrypoint(function.SplitCommandArray(cmd))
 }
 
 func WithEntrypoint(cmd []string) Option {
 	return func(self *Builder) error {
 		if cmd == nil || len(cmd) == 0 {
+			self.containerConfig.Entrypoint = nil
 			return nil
 		}
 		self.containerConfig.Entrypoint = cmd
@@ -353,7 +366,7 @@ func WithContainerNetwork(containerName string) Option {
 	}
 }
 
-func WithLog(item *docker.LogDriverItem) Option {
+func WithLog(item *types.LogDriverItem) Option {
 	return func(self *Builder) error {
 		if item == nil || item.Driver == "" {
 			return nil
@@ -374,11 +387,14 @@ func WithLog(item *docker.LogDriverItem) Option {
 
 func WithDns(ip []string) Option {
 	return func(self *Builder) error {
-		self.hostConfig.DNS = ip
+		self.hostConfig.DNS = function.PluckArrayWalk(ip, func(item string) (string, bool) {
+			return item, net.ParseIP(item) != nil
+		})
 		return nil
 	}
 }
-func WithLabel(item ...docker.ValueItem) Option {
+
+func WithLabel(item ...types.ValueItem) Option {
 	return func(self *Builder) error {
 		if self.containerConfig.Labels == nil {
 			self.containerConfig.Labels = make(map[string]string)
@@ -390,10 +406,11 @@ func WithLabel(item ...docker.ValueItem) Option {
 	}
 }
 
-func WithExtraHosts(item ...docker.ValueItem) Option {
+func WithExtraHosts(item ...types.ValueItem) Option {
 	return func(self *Builder) error {
-		self.hostConfig.ExtraHosts = make([]string, 0)
-
+		if self.hostConfig.ExtraHosts == nil {
+			self.hostConfig.ExtraHosts = make([]string, 0)
+		}
 		for _, valueItem := range item {
 			host := fmt.Sprintf("%s:%s", valueItem.Name, valueItem.Value)
 			if !function.InArray(self.hostConfig.ExtraHosts, host) {
@@ -404,7 +421,7 @@ func WithExtraHosts(item ...docker.ValueItem) Option {
 	}
 }
 
-func WithDevice(item ...docker.DeviceItem) Option {
+func WithDevice(item ...types.DeviceItem) Option {
 	return func(self *Builder) error {
 		self.hostConfig.Devices = make([]container.DeviceMapping, 0)
 
@@ -419,24 +436,29 @@ func WithDevice(item ...docker.DeviceItem) Option {
 	}
 }
 
-func WithGpus(item *docker.GpusItem) Option {
+func WithGpus(item *types.GpusItem) Option {
 	return func(self *Builder) error {
-		if item == nil || !item.Enable {
+		if item == nil {
 			return nil
 		}
 		self.hostConfig.DeviceRequests = make([]container.DeviceRequest, 0)
+		if !item.Enable {
+			return nil
+		}
 
 		if function.IsEmptyArray(item.Device) {
 			item.Device = []string{
 				"all",
 			}
 		}
+		if function.IsEmptyArray(item.Capabilities) {
+			item.Capabilities = []string{
+				"gpu",
+			}
+		}
 		self.hostConfig.DeviceRequests = append(self.hostConfig.DeviceRequests, container.DeviceRequest{
 			DeviceIDs: item.Device,
 			Capabilities: [][]string{
-				{
-					"gpu",
-				},
 				item.Capabilities,
 			},
 			Driver: "nvidia",
@@ -445,19 +467,29 @@ func WithGpus(item *docker.GpusItem) Option {
 	}
 }
 
-func WithHealthcheck(item *docker.HealthcheckItem) Option {
+func WithHealthcheck(item *types.HealthcheckItem) Option {
 	return func(self *Builder) error {
 		if item == nil || item.Cmd == "" {
 			return nil
 		}
-		command := docker.CommandSplit(item.Cmd)
+		if v := function.SplitCommandArray(item.Cmd); len(v) > 1 && (strings.ToUpper(v[0]) == "CMD" || strings.ToUpper(v[0]) == "CMD-SHELL") {
+			item.ShellType = v[0]
+			item.Cmd = strings.TrimPrefix(item.Cmd, v[0])
+		}
 		self.containerConfig.Healthcheck = &container.HealthConfig{
 			Timeout:  time.Duration(item.Timeout) * time.Second,
 			Retries:  item.Retries,
 			Interval: time.Duration(item.Interval) * time.Second,
 			Test: append([]string{
 				item.ShellType,
-			}, command...),
+				item.Cmd,
+			}),
+		}
+		// cmd 模式需要拆分参数
+		if item.ShellType == "CMD" {
+			self.containerConfig.Healthcheck.Test = append([]string{
+				item.ShellType,
+			}, function.SplitCommandArray(item.Cmd)...)
 		}
 		return nil
 	}
@@ -475,6 +507,23 @@ func WithCap(caps ...string) Option {
 		} else {
 			self.hostConfig.CapAdd = caps
 		}
+		return nil
+	}
+}
+
+func WithGroupAdd(gid ...string) Option {
+	return func(self *Builder) error {
+		if function.IsEmptyArray(gid) {
+			return nil
+		}
+		self.hostConfig.GroupAdd = gid
+		return nil
+	}
+}
+
+func WithInit(enable bool) Option {
+	return func(self *Builder) error {
+		self.hostConfig.Init = function.Ptr(enable)
 		return nil
 	}
 }

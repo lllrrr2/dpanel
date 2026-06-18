@@ -3,26 +3,30 @@ package dockerfs
 import (
 	"errors"
 	"fmt"
-	"github.com/docker/go-units"
-	"github.com/donknap/dpanel/common/function"
-	"github.com/donknap/dpanel/common/service/docker"
-	"github.com/donknap/dpanel/common/types/fs"
-	"github.com/spf13/afero"
-	"github.com/spf13/afero/mem"
 	"io"
 	"log/slog"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/docker/go-units"
+	"github.com/donknap/dpanel/common/function"
+	"github.com/donknap/dpanel/common/service/docker"
+	"github.com/donknap/dpanel/common/types/define"
+	"github.com/donknap/dpanel/common/types/fs"
+	"github.com/spf13/afero"
+	"github.com/spf13/afero/mem"
 )
 
 type Fs struct {
-	sdk                     *docker.Builder
+	sdk                     *docker.Client
 	targetContainerName     string // 目标容器名称
 	targetContainerRootPath string // 目标容器的起始根目录
 	proxyContainerName      string
+	workingDir              string
 }
 
 func New(opts ...Option) (afero.Fs, error) {
@@ -61,12 +65,12 @@ func (self Fs) Mkdir(name string, perm os.FileMode) error {
 	panic("implement me")
 }
 
-func (self Fs) MkdirAll(path string, perm os.FileMode) error {
-	path, err := self.getSafePath(path)
+func (self Fs) MkdirAll(p string, perm os.FileMode) error {
+	p, err := self.getSafePath(p)
 	if err != nil {
 		return err
 	}
-	cmd := fmt.Sprintf("mkdir -p \"%s\"", path)
+	cmd := fmt.Sprintf("mkdir -p \"%s\"", p)
 	_, err = self.sdk.ContainerExecResult(self.sdk.Ctx, self.proxyContainerName, cmd)
 	if err != nil {
 		return err
@@ -75,12 +79,15 @@ func (self Fs) MkdirAll(path string, perm os.FileMode) error {
 }
 
 func (self Fs) Open(name string) (afero.File, error) {
+	if name == "" {
+		name = self.workingDir
+	}
 	statPath, err := self.sdk.Client.ContainerStatPath(self.sdk.Ctx, self.targetContainerName, name)
 	if err != nil {
 		return nil, err
 	}
 	fileData := &fs.FileData{
-		Path:     filepath.Join(self.targetContainerRootPath, name),
+		Path:     path.Join(self.targetContainerRootPath, name),
 		Name:     name,
 		Mod:      statPath.Mode,
 		ModTime:  statPath.Mtime,
@@ -121,12 +128,12 @@ func (self Fs) Remove(name string) error {
 	panic("implement me")
 }
 
-func (self Fs) RemoveAll(path string) error {
-	path, err := self.getSafePath(path)
+func (self Fs) RemoveAll(p string) error {
+	p, err := self.getSafePath(p)
 	if err != nil {
 		return err
 	}
-	cmd := fmt.Sprintf("rm -rf \"%s\"", path)
+	cmd := fmt.Sprintf("rm -rf \"%s\"", p)
 	_, err = self.sdk.ContainerExecResult(self.sdk.Ctx, self.proxyContainerName, cmd)
 	if err != nil {
 		return err
@@ -145,11 +152,11 @@ func (self Fs) Stat(name string) (os.FileInfo, error) {
 }
 
 func (self Fs) Chmod(name string, mode os.FileMode) error {
-	path, err := self.getSafePath(name)
+	p, err := self.getSafePath(name)
 	if err != nil {
 		return err
 	}
-	cmd := fmt.Sprintf("chmod -R %d %s", mode, path)
+	cmd := fmt.Sprintf("chmod -R %d %s", mode, p)
 	_, err = self.sdk.ContainerExecResult(self.sdk.Ctx, self.proxyContainerName, cmd)
 	if err != nil {
 		return err
@@ -167,12 +174,12 @@ func (self Fs) Chtimes(name string, atime time.Time, mtime time.Time) error {
 	panic("implement me")
 }
 
-func (self Fs) readDirFromContainer(path string) ([]os.FileInfo, error) {
-	path, err := self.getSafePath(path)
+func (self Fs) readDirFromContainer(rootPath string) ([]os.FileInfo, error) {
+	rootPath, err := self.getSafePath(rootPath)
 	if err != nil {
 		return nil, err
 	}
-	cmd := fmt.Sprintf("ls -AlhX --full-time %s", path)
+	cmd := fmt.Sprintf("ls -AlhX --full-time %s", rootPath)
 	cmd += " | awk 'NR>1 {printf \"{d>%s<d}\", $1;for (i=2; i<=NF; i++) printf \"{v>%s<v}\", $i;}'"
 	out, err := self.sdk.ContainerExecResult(self.sdk.Ctx, self.proxyContainerName, cmd)
 	if err != nil {
@@ -181,7 +188,7 @@ func (self Fs) readDirFromContainer(path string) ([]os.FileInfo, error) {
 	//lines := strings.Split(out, "\t")
 	// 这里不能单纯的用换行进行分隔，正常的数据中会有多余的 \n
 	lines := make([][]byte, 0)
-	reg := regexp.MustCompile(`\{d>[a-zA-Z-][a-zA-Z-]{3}[a-zA-Z-]{3}[a-zA-Z-]{3}<d\}`).FindAllStringIndex(string(out), -1)
+	reg := regexp.MustCompile(`\{d>[a-zA-Z-][a-zA-Z-]{3}[a-zA-Z-]{3}[a-zA-Z-]{3}<d\}`).FindAllStringIndex(out, -1)
 	for i, _ := range reg {
 		line := make([]byte, 0)
 		start, end := reg[i][0], 0
@@ -203,12 +210,12 @@ func (self Fs) readDirFromContainer(path string) ([]os.FileInfo, error) {
 		}
 		if len(row) < 8 {
 			slog.Debug("explorer", "get-path-list", i, "line", string(line))
-			return nil, function.ErrorMessage(".unknow", "error", string(line))
+			return nil, function.ErrorMessage(define.ErrorMessageUnknow, "error", string(line))
 		}
 
 		modStr := strings.Trim(row[0], "`")
 		size, _ := units.FromHumanSize(row[4])
-		modTime, _ := time.Parse(function.ShowYmdHis, row[5]+" "+row[6])
+		modTime, _ := time.Parse(define.DateShowYmdHis, row[5]+" "+row[6])
 
 		if !function.IsEmptyArray(row) {
 			fileData := &fs.FileData{
@@ -230,8 +237,9 @@ func (self Fs) readDirFromContainer(path string) ([]os.FileInfo, error) {
 					fileData.Name = strings.TrimSpace(name)
 				}
 			}
-			rel, _ := filepath.Rel(self.targetContainerRootPath, path)
-			fileData.Path = filepath.Join("/", rel, fileData.Name)
+			rel, _ := filepath.Rel(self.targetContainerRootPath, rootPath)
+			// 因为路径使终是从 Linux 容器或是系统中获取，不能使用 filepath，使用 path 保持路径 / 分隔
+			fileData.Path = filepath.ToSlash(path.Join("/", rel, fileData.Name))
 			fileData.IsDir = fileData.Mod.IsDir()
 			fileData.IsSymlink = fileData.CheckIsSymlink()
 			fileList = append(fileList, fs.NewFileInfo(fileData))
@@ -243,16 +251,20 @@ func (self Fs) readDirFromContainer(path string) ([]os.FileInfo, error) {
 	return fileList, nil
 }
 
-func (self Fs) getSafePath(path string) (string, error) {
+func (self Fs) getSafePath(rootPath string) (string, error) {
+	if rootPath != function.PathClean(rootPath) {
+		return "", errors.New("illegal path")
+	}
+	rootPath = function.PathClean(rootPath)
 	// 目录必须是以 / 开头
-	if !strings.HasPrefix(path, "/") {
+	if !strings.HasPrefix(rootPath, "/") {
 		return "", errors.New("please use absolute address")
 	}
-	if path == "/" {
+	if rootPath == "/" {
 		// 根目录必须加上 / 表示是目录
 		return fmt.Sprintf("%s/", self.targetContainerRootPath), nil
 	}
-	return filepath.Join(self.targetContainerRootPath, path), nil
+	return path.Join(self.targetContainerRootPath, rootPath), nil
 }
 
 func (self Fs) mod(s string) os.FileMode {

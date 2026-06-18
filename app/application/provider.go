@@ -2,37 +2,43 @@ package application
 
 import (
 	"github.com/donknap/dpanel/app/application/http/controller"
+	"github.com/donknap/dpanel/common/function"
 	common "github.com/donknap/dpanel/common/middleware"
 	"github.com/gin-gonic/gin"
-	http_server "github.com/we7coreteam/w7-rangine-go/v2/src/http/server"
+	httpserver "github.com/we7coreteam/w7-rangine-go/v2/src/http/server"
 )
 
 type Provider struct {
 }
 
-func (provider *Provider) Register(httpServer *http_server.Server) {
+func (provider *Provider) Register(httpServer *httpserver.Server) {
 	// 注册一些路由
 	httpServer.RegisterRouters(
 		func(engine *gin.Engine) {
-			cors := engine.Group("/api/", common.CorsMiddleware{}.Process)
+			cors := engine.Group(function.RouterRootApi(), common.CorsMiddleware{}.Process)
 
 			// 站点相关
 			cors.POST("/app/site/create-by-image", controller.Site{}.CreateByImage)
+			cors.POST("/app/site/create-by-command", controller.Site{}.CreateByCommand)
 			cors.POST("/app/site/get-list", controller.Site{}.GetList)
 			cors.POST("/app/site/get-detail", controller.Site{}.GetDetail)
 			cors.POST("/app/site/delete", controller.Site{}.Delete)
+			cors.POST("/app/site/restore", controller.Site{}.Restore)
+			cors.POST("/app/site/prune", controller.Site{}.Prune)
 
 			cors.POST("/app/site-domain/create", controller.SiteDomain{}.Create)
 			cors.POST("/app/site-domain/delete", controller.SiteDomain{}.Delete)
 			cors.POST("/app/site-domain/get-list", controller.SiteDomain{}.GetList)
 			cors.POST("/app/site-domain/get-detail", controller.SiteDomain{}.GetDetail)
-			cors.POST("/app/site-domain/restart-nginx", controller.SiteDomain{}.RestartNginx)
+			cors.POST("/app/site-domain/nginx-restart", controller.SiteDomain{}.NginxRestart)
+			cors.POST("/app/site-domain/nginx-log", controller.SiteDomain{}.NginxLog)
 			cors.POST("/app/site-domain/update-vhost", controller.SiteDomain{}.UpdateVhost)
 
 			cors.POST("/app/site-cert/apply", controller.SiteCert{}.Apply)
 			cors.POST("/app/site-cert/get-list", controller.SiteCert{}.GetList)
 			cors.POST("/app/site-cert/dns-api", controller.SiteCert{}.DnsApi)
 			cors.POST("/app/site-cert/delete", controller.SiteCert{}.Delete)
+			cors.POST("/app/site-cert/get-detail", controller.SiteCert{}.GetDetail)
 			cors.POST("/app/site-cert/import", controller.SiteCert{}.Import)
 			cors.POST("/app/site-cert/download", controller.SiteCert{}.Download)
 
@@ -60,29 +66,27 @@ func (provider *Provider) Register(httpServer *http_server.Server) {
 			cors.POST("/app/container-backup/get-detail", controller.ContainerBackup{}.GetDetail)
 
 			// 镜像相关
-			cors.POST("/app/image/create-by-dockerfile", controller.Image{}.CreateByDockerfile)
-			cors.POST("/app/image/get-list", controller.Image{}.GetList)
-			cors.POST("/app/image/get-detail", controller.Image{}.GetDetail)
-			cors.POST("/app/image/image-delete", controller.Image{}.ImageDelete)
-			cors.POST("/app/image/image-prune", controller.Image{}.ImagePrune)
-			cors.POST("/app/image/build-prune", controller.Image{}.BuildPrune)
-			cors.POST("/app/image/export", controller.Image{}.Export)
 			cors.POST("/app/image/import-by-container-tar", controller.Image{}.ImportByContainerTar)
 			cors.POST("/app/image/import-by-image-tar", controller.Image{}.ImportByImageTar)
+			cors.POST("/app/image/get-list", controller.Image{}.GetList)
+			cors.POST("/app/image/get-detail", controller.Image{}.GetDetail)
+			cors.POST("/app/image/delete", controller.Image{}.Delete)
+			cors.POST("/app/image/prune", controller.Image{}.Prune)
+			cors.POST("/app/image/export", controller.Image{}.Export)
+			cors.POST("/app/image/check-upgrade", controller.Image{}.CheckUpgrade)
 
-			cors.POST("/app/image/get-template-list", controller.Image{}.GetTemplateList)
-			cors.POST("/app/image/get-template-dockerfile", controller.Image{}.GetTemplateDockerfile)
-
-			cors.POST("/app/image/tag-remote", controller.Image{}.TagRemote)
+			cors.POST("/app/image/tag-sync", controller.Image{}.TagSync)
 			cors.POST("/app/image/tag-delete", controller.Image{}.TagDelete)
 			cors.POST("/app/image/tag-add", controller.Image{}.TagAdd)
-			cors.POST("/app/image/tag-sync", controller.Image{}.TagSync)
+			cors.POST("/app/image/tag-push-batch", controller.Image{}.TagPushBatch)
+			cors.POST("/app/image/tag-search", controller.Image{}.TagSearch)
 
-			cors.POST("/app/image/get-list-build", controller.Image{}.GetListBuild)
-			cors.POST("/app/image/get-build-task", controller.Image{}.GetBuildTask)
-			cors.POST("/app/image/delete-build-task", controller.Image{}.DeleteBuildTask)
-			cors.POST("/app/image/update-title", controller.Image{}.UpdateTitle)
-			cors.POST("/app/image/check-upgrade", controller.Image{}.CheckUpgrade)
+			cors.POST("/app/image-build/create", controller.ImageBuild{}.Create)
+			cors.POST("/app/image-build/get-list", controller.ImageBuild{}.GetList)
+			cors.POST("/app/image-build/get-detail", controller.ImageBuild{}.GetDetail)
+			cors.POST("/app/image-build/delete", controller.ImageBuild{}.Delete)
+			cors.POST("/app/image-build/prune", controller.ImageBuild{}.Prune)
+			cors.POST("/app/image-build/buildx", controller.ImageBuild{}.Buildx)
 
 			// 文件相关
 			cors.POST("/app/explorer/export", controller.Explorer{}.Export)
@@ -96,7 +100,8 @@ func (provider *Provider) Register(httpServer *http_server.Server) {
 			cors.POST("/app/explorer/get-file-stat", controller.Explorer{}.GetFileStat)
 			cors.POST("/app/explorer/get-user-list", controller.Explorer{}.GetUserList)
 			cors.POST("/app/explorer/mkdir", controller.Explorer{}.MkDir)
-			cors.POST("/app/explorer/attach-volume", controller.Explorer{}.AttachVolume)
+			cors.POST("/app/explorer/copy", controller.Explorer{}.Copy)
+			cors.POST("/app/explorer/destroy-proxy-container", controller.Explorer{}.DestroyProxyContainer)
 
 			// 日志相关
 			cors.POST("/app/log/run", controller.RunLog{}.Run)
@@ -122,17 +127,30 @@ func (provider *Provider) Register(httpServer *http_server.Server) {
 			cors.POST("/app/compose/create", controller.Compose{}.Create)
 			cors.POST("/app/compose/get-list", controller.Compose{}.GetList)
 			cors.POST("/app/compose/get-task", controller.Compose{}.GetTask)
-			cors.POST("/app/compose/delete", controller.Compose{}.Delete)
 			cors.POST("/app/compose/get-from-uri", controller.Compose{}.GetFromUri)
-			cors.POST("/app/compose/parse", controller.Compose{}.Parse)
+			cors.POST("/app/compose/get-from-git", controller.Compose{}.GetFromGit)
+			cors.POST("/app/compose/download", controller.Compose{}.Download)
 
 			cors.POST("/app/compose/container-deploy", controller.Compose{}.ContainerDeploy)
 			cors.POST("/app/compose/container-destroy", controller.Compose{}.ContainerDestroy)
 			cors.POST("/app/compose/container-ctrl", controller.Compose{}.ContainerCtrl)
-			cors.POST("/app/compose/container-process-kill", controller.Compose{}.ContainerProcessKill)
 			cors.POST("/app/compose/container-log", controller.Compose{}.ContainerLog)
 
-			cors.POST("/app/compose/download", controller.Compose{}.Download)
+			cors.POST("/app/swarm/info", controller.Swarm{}.Info)
+			cors.POST("/app/swarm/info-join", controller.Swarm{}.InfoJoin)
+			cors.POST("/app/swarm/init", controller.Swarm{}.Init)
+			cors.POST("/app/swarm/log", controller.Swarm{}.Log)
+			cors.POST("/app/swarm/node-remove", controller.Swarm{}.NodeRemove)
+			cors.POST("/app/swarm/node-list", controller.Swarm{}.NodeList)
+			cors.POST("/app/swarm/node-update", controller.Swarm{}.NodeUpdate)
+			cors.POST("/app/swarm/node-prune", controller.Swarm{}.NodePrune)
+			cors.POST("/app/swarm/service-list", controller.Swarm{}.ServiceList)
+			cors.POST("/app/swarm/service-create", controller.Swarm{}.ServiceCreate)
+			cors.POST("/app/swarm/service-scaling", controller.Swarm{}.ServiceScaling)
+			cors.POST("/app/swarm/service-delete", controller.Swarm{}.ServiceDelete)
+			cors.POST("/app/swarm/service-detail", controller.Swarm{}.ServiceDetail)
+			cors.POST("/app/swarm/task-list", controller.Swarm{}.TaskList)
+			cors.POST("/app/swarm/task-list-in-node", controller.Swarm{}.TaskListInNode)
 		},
 	)
 }

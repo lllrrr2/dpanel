@@ -3,27 +3,13 @@ package controller
 import (
 	"archive/zip"
 	"bytes"
+	"context"
 	"crypto/ecdsa"
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/pem"
 	"errors"
 	"fmt"
-	"github.com/donknap/dpanel/app/application/logic"
-	logic2 "github.com/donknap/dpanel/app/common/logic"
-	"github.com/donknap/dpanel/common/accessor"
-	"github.com/donknap/dpanel/common/dao"
-	"github.com/donknap/dpanel/common/entity"
-	"github.com/donknap/dpanel/common/function"
-	"github.com/donknap/dpanel/common/service/acme"
-	"github.com/donknap/dpanel/common/service/docker"
-	"github.com/donknap/dpanel/common/service/notice"
-	"github.com/donknap/dpanel/common/service/storage"
-	"github.com/donknap/dpanel/common/service/ws"
-	"github.com/gin-gonic/gin"
-	"github.com/we7coreteam/w7-rangine-go/v2/src/http/controller"
-	"gorm.io/datatypes"
-	"gorm.io/gen"
 	"io"
 	"log/slog"
 	"os"
@@ -31,6 +17,22 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/donknap/dpanel/app/application/logic"
+	logic2 "github.com/donknap/dpanel/app/common/logic"
+	"github.com/donknap/dpanel/common/accessor"
+	"github.com/donknap/dpanel/common/dao"
+	"github.com/donknap/dpanel/common/entity"
+	"github.com/donknap/dpanel/common/function"
+	"github.com/donknap/dpanel/common/service/acme"
+	"github.com/donknap/dpanel/common/service/docker/types"
+	"github.com/donknap/dpanel/common/service/storage"
+	"github.com/donknap/dpanel/common/service/ws"
+	"github.com/donknap/dpanel/common/types/define"
+	"github.com/gin-gonic/gin"
+	"github.com/we7coreteam/w7-rangine-go/v2/src/http/controller"
+	"gorm.io/datatypes"
+	"gorm.io/gen"
 )
 
 type SiteCert struct {
@@ -57,9 +59,9 @@ func (self SiteCert) DnsApi(http *gin.Context) {
 	}
 
 	for _, item := range logic.DefaultDnsApi {
-		if exists, _ := function.IndexArrayWalk(dnsApi, func(i accessor.DnsApi) bool {
+		if _, ok := function.IndexArrayWalk(dnsApi, func(i accessor.DnsApi) bool {
 			return i.ServerName == item.ServerName
-		}); !exists {
+		}); !ok {
 			dnsApi = append(dnsApi, item)
 		}
 	}
@@ -73,9 +75,9 @@ func (self SiteCert) DnsApi(http *gin.Context) {
 			}
 			return i, true
 		}) {
-			if exists, index := function.IndexArrayWalk(dnsApi, func(i accessor.DnsApi) bool {
+			if index, ok := function.IndexArrayWalk(dnsApi, func(i accessor.DnsApi) bool {
 				return i.ServerName == item.ServerName
-			}); exists {
+			}); ok {
 				dnsApi[index] = item
 			} else {
 				dnsApi = append(dnsApi, item)
@@ -85,9 +87,9 @@ func (self SiteCert) DnsApi(http *gin.Context) {
 
 	if !function.IsEmptyArray(params.User) {
 		for _, item := range params.User {
-			if exists, index := function.IndexArrayWalk(dnsApi, func(i accessor.DnsApi) bool {
+			if index, ok := function.IndexArrayWalk(dnsApi, func(i accessor.DnsApi) bool {
 				return i.ServerName == item.ServerName
-			}); exists {
+			}); ok {
 				dnsApi[index] = item
 			} else {
 				dnsApi = append(dnsApi, item)
@@ -122,13 +124,15 @@ func (self SiteCert) DnsApi(http *gin.Context) {
 func (self SiteCert) Apply(http *gin.Context) {
 	type ParamsValidate struct {
 		Type        string   `json:"type"`
-		Domain      []string `json:"domain" binding:"required_if=Type apply"`
-		Email       string   `json:"email" binding:"required_if=Type apply"`
-		CertServer  string   `json:"certServer" binding:"required_if=Type apply" oneof:"zerossl letsencrypt"`
+		Domain      []string `json:"domain"`
+		Email       string   `json:"email"`
+		CertServer  string   `json:"certServer"`
 		AutoUpgrade bool     `json:"autoUpgrade"`
 		Renew       bool     `json:"renew"`
 		Debug       bool     `json:"debug"`
-		DnsApi      string   `json:"dnsApi" binding:"required_if=Type apply"`
+		DnsApi      string   `json:"dnsApi"`
+		EabKid      string   `json:"eabKid"`
+		EabHmacKey  string   `json:"eabHmacKey"`
 	}
 	params := ParamsValidate{}
 	if !self.Validate(http, &params) {
@@ -141,6 +145,7 @@ func (self SiteCert) Apply(http *gin.Context) {
 		acme.WithCertServer(params.CertServer),
 		//acme.WithCertRootPath(storage.Local{}.GetStorageCertPath()),
 		acme.WithAutoUpgrade(params.AutoUpgrade),
+		acme.WithReloadCommand("/docker/acme-reload.sh"),
 	}
 
 	if params.Renew {
@@ -159,31 +164,37 @@ func (self SiteCert) Apply(http *gin.Context) {
 		} else {
 			dnsApiList := make([]accessor.DnsApi, 0)
 			logic2.Setting{}.GetByKey(logic2.SettingGroupSetting, logic2.SettingGroupSettingDnsApi, &dnsApiList)
-			if exists, i := function.IndexArrayWalk(dnsApiList, func(i accessor.DnsApi) bool {
+			if i, ok := function.IndexArrayWalk(dnsApiList, func(i accessor.DnsApi) bool {
 				return i.ServerName == params.DnsApi
-			}); exists {
-				env := function.PluckArrayWalk(dnsApiList[i].Env, func(i docker.EnvItem) (string, bool) {
+			}); ok {
+				env := function.PluckArrayWalk(dnsApiList[i].Env, func(i types.EnvItem) (string, bool) {
 					return fmt.Sprintf("%s=%s", i.Name, i.Value), true
 				})
 				options = append(options, acme.WithDnsApi(dnsApiList[i].ServerName, env))
 			}
 		}
 	}
-
-	builder, err := acme.New(options...)
-	if err != nil {
-		self.JsonResponseWithError(http, err, 500)
-		return
-	}
-	response, err := builder.Run()
-	if err != nil {
-		self.JsonResponseWithError(http, err, 500)
-		return
-	}
 	wsBuffer := ws.NewProgressPip(ws.MessageTypeDomainApply)
 	defer wsBuffer.Close()
 
-	errMessage := notice.Message{}.New(".domainCertIssueFailed")
+	builder, err := acme.New(wsBuffer.Context(), options...)
+	if err != nil {
+		self.JsonResponseWithError(http, err, 500)
+		return
+	}
+
+	cmd, err := builder.Run()
+	if err != nil {
+		self.JsonResponseWithError(http, err, 500)
+		return
+	}
+
+	go func() {
+		<-wsBuffer.Done()
+		_ = cmd.Close()
+	}()
+
+	errMessage := function.ErrorMessage(define.ErrorMessageSiteDomainCertIssueFailed)
 	success := false
 	wsBuffer.OnWrite = func(p string) error {
 		wsBuffer.BroadcastMessage(p)
@@ -191,14 +202,38 @@ func (self SiteCert) Apply(http *gin.Context) {
 			success = true
 		}
 		if strings.Contains(p, "Error adding TXT record to domain") {
-			errMessage = function.ErrorMessage(".domainCertAddTxtFailed")
+			errMessage = function.ErrorMessage(define.ErrorMessageSiteDomainCertAddTxtFailed)
 		}
 		return nil
 	}
 
-	_, err = io.Copy(wsBuffer, response)
+	// 如果需要注册帐号，先运行
+	if params.EabKid != "" && params.EabHmacKey != "" {
+		if b, err := acme.New(wsBuffer.Context(),
+			acme.WithEmail(params.Email),
+			acme.WithCertServer(params.CertServer),
+			acme.WithEabAccount(params.EabKid, params.EabHmacKey),
+		); err == nil {
+			result, err := b.Result()
+			if err != nil {
+				self.JsonResponseWithError(http, err, 500)
+				return
+			}
+			wsBuffer.BroadcastMessage(string(result))
+		} else {
+			self.JsonResponseWithError(http, err, 500)
+			return
+		}
+	}
+
+	out, err := cmd.RunInPip()
 	if err != nil {
 		self.JsonResponseWithError(http, err, 500)
+		return
+	}
+	_, err = io.Copy(wsBuffer, out)
+	if err != nil {
+		self.JsonResponseWithError(http, function.ErrorMessage(define.ErrorMessageCommonCancelOperator, "message", err.Error()), 500)
 		return
 	}
 	if success {
@@ -242,7 +277,7 @@ func (self SiteCert) Import(http *gin.Context) {
 		break
 	}
 	if len(cert.DNSNames) <= 0 {
-		self.JsonResponseWithError(http, errInvalidCertFile, 500)
+		self.JsonResponseWithError(http, function.ErrorMessage(define.ErrorMessageSiteDomainCertHasNotDNSName), 500)
 		return
 	}
 	mainDomain := cert.DNSNames[0]
@@ -267,7 +302,7 @@ func (self SiteCert) Import(http *gin.Context) {
 		fmt.Sprintf("Le_NextRenewTimeStr='%s'", cert.NotAfter.Format(time.RFC3339)),
 		fmt.Sprintf("Le_SerialNumber='%s'", cert.SerialNumber.String()),
 	}
-	confFilePath := filepath.Join(storage.Local{}.GetNginxCertPath(), fmt.Sprintf(logic.CertName, mainDomain), mainDomain+".conf")
+	confFilePath := filepath.Join(storage.Local{}.GetCertDomainPath(), fmt.Sprintf(logic.CertName, mainDomain), mainDomain+".conf")
 	err = os.MkdirAll(filepath.Dir(confFilePath), os.ModePerm)
 	if err != nil {
 		self.JsonResponseWithError(http, err, 500)
@@ -293,7 +328,7 @@ func (self SiteCert) Import(http *gin.Context) {
 }
 
 func (self SiteCert) GetList(http *gin.Context) {
-	builder, err := acme.New()
+	builder, err := acme.New(context.Background())
 	if err != nil {
 		self.JsonResponseWithError(http, err, 500)
 		return
@@ -328,11 +363,11 @@ func (self SiteCert) Delete(http *gin.Context) {
 		if list, _ := dao.SiteDomain.Where(gen.Cond(
 			datatypes.JSONQuery("setting").Equals(d, "certName"),
 		)...).First(); list != nil {
-			self.JsonResponseWithError(http, notice.Message{}.New(".siteDomainCertHasBindDomain"), 500)
+			self.JsonResponseWithError(http, function.ErrorMessage(define.ErrorMessageSiteDomainCertHasBindDomain), 500)
 			return
 		}
 	}
-	builder, err := acme.New()
+	builder, err := acme.New(context.Background())
 	if err != nil {
 		self.JsonResponseWithError(http, err, 500)
 		return
@@ -365,6 +400,31 @@ func (self SiteCert) Delete(http *gin.Context) {
 	return
 }
 
+func (self SiteCert) GetDetail(http *gin.Context) {
+	type ParamsValidate struct {
+		MainDomain string `json:"mainDomain"`
+	}
+	params := ParamsValidate{}
+	if !self.Validate(http, &params) {
+		return
+	}
+	var err error
+	builder, err := acme.New(context.Background())
+	if err != nil {
+		self.JsonResponseWithError(http, err, 500)
+		return
+	}
+	cert, err := builder.Info(params.MainDomain)
+	if err != nil {
+		self.JsonResponseWithError(http, err, 500)
+		return
+	}
+	self.JsonResponseWithoutError(http, gin.H{
+		"detail": cert,
+	})
+	return
+}
+
 func (self SiteCert) Download(http *gin.Context) {
 	type ParamsValidate struct {
 		Name string `json:"name" binding:"required"`
@@ -373,7 +433,7 @@ func (self SiteCert) Download(http *gin.Context) {
 	if !self.Validate(http, &params) {
 		return
 	}
-	builder, err := acme.New()
+	builder, err := acme.New(context.Background())
 	if err != nil {
 		self.JsonResponseWithError(http, err, 500)
 		return

@@ -2,37 +2,42 @@ package acme
 
 import (
 	"bufio"
+	"bytes"
+	"context"
 	"errors"
-	"github.com/donknap/dpanel/common/function"
-	"github.com/donknap/dpanel/common/service/exec"
-	"io"
-	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/donknap/dpanel/common/function"
+	"github.com/donknap/dpanel/common/service/exec"
+	"github.com/donknap/dpanel/common/service/exec/local"
+	"github.com/donknap/dpanel/common/types/define"
 )
 
 const (
 	DefaultCommandName     = "/root/.acme.sh/acme.sh"
-	EnvOverrideCommandName = "ACME_OVERRIDE_COMMAND_NAME"
-	EnvOverrideConfigHome  = "ACME_OVERRIDE_CONFIG_HOME"
+	EnvOverrideCommandName = "DP_ACME_COMMAND_NAME"
+	EnvOverrideConfigHome  = "DP_ACME_CONFIG_HOME"
 )
 
-func New(opts ...Option) (*Acme, error) {
+func New(ctx context.Context, opts ...Option) (*Acme, error) {
 	b := &Acme{
 		commandName: DefaultCommandName,
 		argv:        make([]string, 0),
+		env:         make([]string, 0),
+		ctx:         ctx,
 	}
 	if override := os.Getenv(EnvOverrideCommandName); override != "" {
 		b.commandName = override
 	}
 	if override := os.Getenv(EnvOverrideConfigHome); override != "" {
 		b.configHome = override
-		b.argv = append(b.argv, "--config-home", override)
+		b.argv = append(b.argv, "--config-home", b.configHome)
 	} else {
 		b.configHome = filepath.Dir(b.commandName)
 	}
-	b.argv = append(b.argv, "--ecc")
+	b.env = append(b.env, "HTTP_PROXY="+os.Getenv("HTTP_PROXY"), "HTTPS_PROXY="+os.Getenv("HTTP_PROXY"))
 	for _, opt := range opts {
 		err := opt(b)
 		if err != nil {
@@ -47,22 +52,37 @@ type Acme struct {
 	argv        []string
 	env         []string
 	configHome  string
+	ctx         context.Context
 }
 
-func (self Acme) Run() (io.ReadCloser, error) {
-	options := []exec.Option{
-		exec.WithCommandName(self.commandName),
-		exec.WithArgs(self.argv...),
+func (self Acme) Run() (exec.Executor, error) {
+	argv := append(self.argv, "--ecc")
+	options := []local.Option{
+		local.WithCommandName(self.commandName),
+		local.WithArgs(argv...),
+		local.WithCtx(self.ctx),
 	}
 	if !function.IsEmptyArray(self.env) {
-		options = append(options, exec.WithEnv(self.env))
+		options = append(options, local.WithEnv(self.env))
 	}
-	slog.Debug("acme apply run", "env", self.env, "argv", self.argv)
-	cmd, err := exec.New(options...)
+	return local.New(options...)
+}
+
+func (self Acme) Result() ([]byte, error) {
+	argv := append(self.argv, "--register-account")
+	options := []local.Option{
+		local.WithCommandName(self.commandName),
+		local.WithArgs(argv...),
+		local.WithCtx(self.ctx),
+	}
+	if !function.IsEmptyArray(self.env) {
+		options = append(options, local.WithEnv(self.env))
+	}
+	cmd, err := local.New(options...)
 	if err != nil {
 		return nil, err
 	}
-	return cmd.RunInPip()
+	return cmd.RunWithResult()
 }
 
 type Cert struct {
@@ -95,79 +115,117 @@ func (self *Cert) GetRootPath() string {
 	return self.RootPath + "_ecc"
 }
 
-func (self *Cert) GetConfigPath() string {
-	return filepath.Join(self.GetRootPath(), self.Domain[0]+".conf")
-}
-
 func (self Acme) List() ([]*Cert, error) {
-	self.argv = append(self.argv, "--list", "--listraw")
-	cmd, err := exec.New(
-		exec.WithCommandName(self.commandName),
-		exec.WithArgs(self.argv...),
+	argv := append(self.argv, "--list", "--listraw")
+	cmd, err := local.New(
+		local.WithCommandName(self.commandName),
+		local.WithArgs(argv...),
 	)
 	if err != nil {
 		return nil, err
 	}
-	out, err := cmd.Run()
+	out, err := cmd.RunWithResult()
 	if err != nil {
 		return nil, err
 	}
-	result := make([]*Cert, 0)
-	scanner := bufio.NewScanner(out)
-	for scanner.Scan() {
-		if strings.Contains(scanner.Text(), "Main_Domain") {
-			continue
-		}
-		if split := strings.Split(scanner.Text(), "|"); len(split) >= 6 {
-			domain := []string{
-				split[0],
+	return self.ParseListRaw(out), nil
+}
+
+func (self Acme) Info(mainDomain string) (*Cert, error) {
+	list, err := self.List()
+	if err != nil {
+		return nil, err
+	}
+	cert, _, ok := function.PluckArrayItemWalk(list, func(item *Cert) bool {
+		return item.MainDomain == mainDomain
+	})
+	if !ok {
+		return nil, function.ErrorMessage(define.ErrorMessageCommonDataNotFoundOrDeleted)
+	}
+	if !cert.IsImport() {
+		argv := append(self.argv, "--info", "-d", cert.MainDomain)
+		if cmd, err := local.New(
+			local.WithCommandName(self.commandName),
+			local.WithArgs(argv...),
+		); err == nil {
+			if info, err := cmd.RunWithResult(); err == nil {
+				item := function.PluckArrayWalk(strings.Split(string(info), "\n"), func(i string) (string, bool) {
+					if k, v, exists := strings.Cut(i, "="); exists && k == "Le_Webroot" {
+						return strings.Trim(v, "'"), true
+					}
+					return "", false
+				})
+				cert.DnsApi = strings.Join(item, "")
 			}
-			if split[2] != "no" {
-				domain = append(domain, strings.Split(split[2], ",")...)
-			}
-			success := false
-			if split[4] != "" && split[3] != "" {
-				success = true
-			}
-			cert := &Cert{
-				MainDomain: split[0],
-				RootPath:   filepath.Join(self.configHome, split[0]),
-				Domain:     domain,
-				CA:         split[3],
-				CreatedAt:  split[4],
-				RenewAt:    split[5],
-				Success:    success,
-			}
-			if !cert.IsImport() {
-				if conf, err := os.ReadFile(cert.GetConfigPath()); err == nil {
-					item := function.PluckArrayWalk(strings.Split(string(conf), "\n"), func(i string) (string, bool) {
-						if k, v, exists := strings.Cut(i, "="); exists && k == "Le_Webroot" {
-							return strings.Trim(v, "'"), true
-						}
-						return "", false
-					})
-					cert.DnsApi = strings.Join(item, "")
-				}
-			}
-			result = append(result, cert)
 		}
 	}
-	return result, nil
+	return cert, nil
+}
+
+func (self Acme) ParseListRaw(out []byte) []*Cert {
+	certList := make([]map[string]string, 0)
+	certHeader := make([]string, 0)
+
+	scanner := bufio.NewScanner(bytes.NewBuffer(out))
+	for scanner.Scan() {
+		if strings.Contains(scanner.Text(), "Main_Domain") {
+			certHeader = strings.Split(scanner.Text(), "|")
+			continue
+		}
+		if values := strings.Split(scanner.Text(), "|"); len(values) >= 6 {
+			entry := make(map[string]string)
+			for i, value := range values {
+				if key := strings.TrimSpace(certHeader[i]); key != "" {
+					entry[key] = value
+				}
+			}
+			certList = append(certList, entry)
+		}
+	}
+
+	result := make([]*Cert, 0)
+	for _, item := range certList {
+		domain := []string{
+			item["Main_Domain"],
+		}
+		if item["SAN_Domains"] != "" && item["SAN_Domains"] != "no" {
+			domain = append(domain, strings.Split(item["SAN_Domains"], ",")...)
+		}
+
+		success := false
+		if item["CA"] != "" && item["Created"] != "" {
+			success = true
+		}
+		cert := &Cert{
+			MainDomain: item["Main_Domain"],
+			RootPath:   filepath.Join(self.configHome, item["Main_Domain"]),
+			Domain:     domain,
+			CA:         item["CA"],
+			CreatedAt:  item["Created"],
+			RenewAt:    item["Renew"],
+			Success:    success,
+		}
+		result = append(result, cert)
+	}
+	return result
 }
 
 func (self Acme) Remove(name string) error {
 	self.argv = append(self.argv, "--remove", "-d", name)
-	cmd, err := exec.New(
-		exec.WithCommandName(self.commandName),
-		exec.WithArgs(self.argv...),
+	cmd, err := local.New(
+		local.WithCommandName(self.commandName),
+		local.WithArgs(self.argv...),
 	)
 	if err != nil {
 		return err
 	}
-	out := cmd.RunWithResult()
-	if strings.Contains(out, "has been removed") {
+	out, err := cmd.RunWithResult()
+	if err != nil {
+		return err
+	}
+	if strings.Contains(string(out), "has been removed") {
 		return nil
 	} else {
-		return errors.New(out)
+		return errors.New(string(out))
 	}
 }

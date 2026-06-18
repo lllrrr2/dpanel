@@ -2,6 +2,13 @@ package controller
 
 import (
 	"fmt"
+	"io"
+	"log/slog"
+	"os"
+	"sort"
+	"strings"
+	"time"
+
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/image"
@@ -15,23 +22,20 @@ import (
 	"github.com/donknap/dpanel/common/entity"
 	"github.com/donknap/dpanel/common/function"
 	"github.com/donknap/dpanel/common/service/docker"
+	"github.com/donknap/dpanel/common/service/docker/types"
 	"github.com/donknap/dpanel/common/service/notice"
 	"github.com/donknap/dpanel/common/service/storage"
+	"github.com/donknap/dpanel/common/types/define"
 	"github.com/donknap/dpanel/common/types/event"
 	"github.com/gin-gonic/gin"
+	"github.com/mholt/archives"
 	v1 "github.com/opencontainers/image-spec/specs-go/v1"
+	"github.com/patrickmn/go-cache"
 	"github.com/we7coreteam/w7-rangine-go/v2/pkg/support/facade"
 	"github.com/we7coreteam/w7-rangine-go/v2/src/http/controller"
 	"gorm.io/datatypes"
 	"gorm.io/gen"
 	"gorm.io/gorm"
-	"io"
-	"log/slog"
-	"os"
-	"path/filepath"
-	"sort"
-	"strconv"
-	"strings"
 )
 
 type Container struct {
@@ -40,8 +44,8 @@ type Container struct {
 
 func (self Container) Status(http *gin.Context) {
 	type ParamsValidate struct {
-		Md5     string `form:"md5" binding:"required"`
-		Operate string `form:"operate" binding:"required,oneof=start stop restart pause unpause"`
+		Md5     string `json:"md5" binding:"required"`
+		Operate string `json:"operate" binding:"required,oneof=start stop restart pause unpause"`
 	}
 	params := ParamsValidate{}
 	if !self.Validate(http, &params) {
@@ -78,8 +82,8 @@ func (self Container) Status(http *gin.Context) {
 
 func (self Container) GetList(http *gin.Context) {
 	type ParamsValidate struct {
-		Md5       string `json:"md5"`
 		SiteTitle string `json:"siteTitle"`
+		Image     string `json:"image"`
 	}
 	params := ParamsValidate{}
 	if !self.Validate(http, &params) {
@@ -87,9 +91,6 @@ func (self Container) GetList(http *gin.Context) {
 	}
 	list := make([]container.Summary, 0)
 	filter := filters.NewArgs()
-	if params.Md5 != "" {
-		filter.Add("id", params.Md5)
-	}
 	list, err := docker.Sdk.Client.ContainerList(docker.Sdk.Ctx, container.ListOptions{
 		All:     true,
 		Latest:  true,
@@ -117,47 +118,65 @@ func (self Container) GetList(http *gin.Context) {
 		}
 	}
 
-	result := make([]container.Summary, 0)
-	if params.SiteTitle != "" {
-		for _, item := range list {
-			if function.InArray(searchContainerIds, item.ID) {
-				result = append(result, item)
-				continue
+	list = function.PluckArrayWalk(list, func(item container.Summary) (container.Summary, bool) {
+		if v, ok := item.Labels[define.DPanelLabelContainerHidden]; ok && (v == "true" || v == "1") {
+			return item, false
+		}
+
+		if function.IsEmptyArray(searchContainerIds) && params.Image == "" && params.SiteTitle == "" {
+			return item, true
+		}
+		if function.InArray(searchContainerIds, item.ID) {
+			return item, true
+		}
+		if params.Image != "" && (strings.Contains(item.Image, params.Image) || strings.Contains(item.ImageID, params.Image)) {
+			return item, true
+		}
+		if params.SiteTitle != "" {
+			if strings.HasPrefix(item.ID, params.SiteTitle) {
+				return item, true
 			}
 			for _, name := range item.Names {
 				if strings.Contains(name, params.SiteTitle) {
-					result = append(result, item)
-					break
+					return item, true
 				}
 			}
 		}
-	} else {
-		result = list
-	}
+		return item, false
+	})
 
 	var containerName []string
-	for index, item := range result {
+	for index, item := range list {
 		containerName = append(containerName, item.Names...)
+		containerInfo, err := docker.Sdk.Client.ContainerInspect(docker.Sdk.Ctx, item.ID)
+		var inspectInfo *container.InspectResponse
+		if err == nil {
+			inspectInfo = &containerInfo
+		}
+		status := logic.Container{}.RuntimeStatus(logic.ContainerRuntimeItem{
+			Summary: item,
+			Inspect: inspectInfo,
+		})
+		if status.State != "" {
+			list[index].State = status.State
+		}
+		if status.Message != "" {
+			list[index].Status = status.Message
+		}
 		// 如果是直接绑定到宿主机网络或是 Macvlan，端口号不会显示到容器详情中
 		// 需要通过获取镜像详情数据获取一下
-		if function.IsEmptyArray(item.Ports) {
-			if info, err := docker.Sdk.Client.ContainerInspect(docker.Sdk.Ctx, item.ID); err == nil && info.HostConfig != nil && !function.IsEmptyMap(info.HostConfig.PortBindings) {
+		if item.HostConfig.NetworkMode == network.NetworkHost {
+			if err == nil && containerInfo.Config != nil && !function.IsEmptyMap(containerInfo.Config.ExposedPorts) {
 				ports := make([]container.Port, 0)
-				for port, bindings := range info.HostConfig.PortBindings {
-					for _, binding := range bindings {
-						hostPort, _ := strconv.Atoi(binding.HostPort)
-						if binding.HostIP == "" {
-							binding.HostIP = "0.0.0.0"
-						}
-						ports = append(ports, container.Port{
-							IP:          binding.HostIP,
-							PublicPort:  uint16(hostPort),
-							PrivatePort: uint16(port.Int()),
-							Type:        port.Proto(),
-						})
-					}
+				for port, _ := range containerInfo.Config.ExposedPorts {
+					ports = append(ports, container.Port{
+						IP:          "0.0.0.0",
+						PublicPort:  uint16(port.Int()),
+						PrivatePort: uint16(port.Int()),
+						Type:        port.Proto(),
+					})
 				}
-				result[index].Ports = ports
+				list[index].Ports = ports
 			}
 		}
 	}
@@ -167,14 +186,17 @@ func (self Container) GetList(http *gin.Context) {
 	})...))
 	siteList, _ := query.Find()
 
-	sort.Slice(result, func(i, j int) bool {
-		return result[i].Names[0] < result[j].Names[0]
+	sort.Slice(list, func(i, j int) bool {
+		if function.IsEmptyArray(list[i].Names) || function.IsEmptyArray(list[j].Names) {
+			return false
+		}
+		return list[i].Names[0] < list[j].Names[0]
 	})
 
 	domainList, _ := dao.SiteDomain.Where(dao.SiteDomain.ContainerID.In(containerName...)).Find()
 
 	self.JsonResponseWithoutError(http, gin.H{
-		"list":       result,
+		"list":       list,
 		"siteList":   siteList,
 		"domainList": domainList,
 	})
@@ -183,7 +205,7 @@ func (self Container) GetList(http *gin.Context) {
 
 func (self Container) GetDetail(http *gin.Context) {
 	type ParamsValidate struct {
-		Md5 string `form:"md5" binding:"required"`
+		Md5 string `json:"md5" binding:"required"`
 	}
 	params := ParamsValidate{}
 	if !self.Validate(http, &params) {
@@ -195,7 +217,10 @@ func (self Container) GetDetail(http *gin.Context) {
 		self.JsonResponseWithError(http, err, 500)
 		return
 	}
-
+	dpanelInfo := logic2.Setting{}.GetDPanelInfo()
+	if docker.Sdk.DockerEnv.Default && dpanelInfo.ContainerInfo.ContainerJSONBase != nil && dpanelInfo.ContainerInfo.Name == detail.Name {
+		detail.Config.Labels[define.DPanelLabelContainerDPanelSelf] = "true"
+	}
 	ignore := accessor.ContainerCheckIgnoreUpgrade{}
 	logic2.Setting{}.GetByKey(logic2.SettingGroupSetting, logic2.SettingGroupSettingCheckContainerIgnore, &ignore)
 
@@ -210,20 +235,25 @@ func (self Container) GetDetail(http *gin.Context) {
 
 func (self Container) Update(http *gin.Context) {
 	type ParamsValidate struct {
-		Md5     string `json:"md5" binding:"required"`
-		Restart string `json:"restart" binding:"omitempty,oneof=no on-failure unless-stopped always"`
-		Name    string `json:"name"`
+		Md5     string               `json:"md5" binding:"required"`
+		Restart *types.RestartPolicy `json:"restart"`
+		Name    string               `json:"name"`
 	}
 	params := ParamsValidate{}
 	if !self.Validate(http, &params) {
 		return
 	}
-	if params.Restart != "" {
-		restartPolicy := container.RestartPolicy{
-			Name: docker.GetRestartPolicyByString(params.Restart),
+	if params.Restart != nil {
+		restartPolicy := container.RestartPolicy{}
+		if params.Restart.Name != "" {
+			restartPolicy.Name = function.ParseRestartPolicy(params.Restart.Name)
 		}
-		if params.Restart == "on-failure" {
+		if restartPolicy.Name == container.RestartPolicyOnFailure {
 			restartPolicy.MaximumRetryCount = 5
+		}
+		if params.Restart.MaxAttempt > 0 {
+			restartPolicy.Name = container.RestartPolicyOnFailure
+			restartPolicy.MaximumRetryCount = params.Restart.MaxAttempt
 		}
 		_, err := docker.Sdk.Client.ContainerUpdate(docker.Sdk.Ctx, params.Md5, container.UpdateConfig{
 			RestartPolicy: restartPolicy,
@@ -232,7 +262,6 @@ func (self Container) Update(http *gin.Context) {
 			self.JsonResponseWithError(http, err, 500)
 			return
 		}
-
 	}
 	if params.Name != "" {
 		err := docker.Sdk.Client.ContainerRename(docker.Sdk.Ctx, params.Md5, params.Name)
@@ -256,6 +285,7 @@ func (self Container) Update(http *gin.Context) {
 		}
 		_ = dao.Site.Save(siteRow)
 	}
+
 	self.JsonSuccessResponse(http)
 	return
 }
@@ -265,6 +295,7 @@ func (self Container) Copy(http *gin.Context) {
 		Md5              string `json:"md5" binding:"required"`
 		CopyName         string `json:"copyName" binding:"required"`
 		EnableRandomPort bool   `json:"enableRandomPort"`
+		EnableStart      bool   `json:"enableStart"`
 	}
 	params := ParamsValidate{}
 	if !self.Validate(http, &params) {
@@ -275,10 +306,16 @@ func (self Container) Copy(http *gin.Context) {
 		self.JsonResponseWithError(http, err, 500)
 		return
 	}
+	// 获取一个镜像 tag 是否存在，如果不存在则改用镜像 hash
+	if _, err := docker.Sdk.Client.ImageInspect(docker.Sdk.Ctx, containerInfo.Config.Image); err != nil {
+		containerInfo.Config.Image = containerInfo.Image
+	}
+
 	if _, err := docker.Sdk.Client.ContainerInspect(docker.Sdk.Ctx, params.CopyName); err == nil {
-		self.JsonResponseWithError(http, function.ErrorMessage(".commonIdAlreadyExists", "name", params.CopyName), 500)
+		self.JsonResponseWithError(http, function.ErrorMessage(define.ErrorMessageCommonIdAlreadyExists, "name", params.CopyName), 500)
 		return
 	}
+
 	if params.EnableRandomPort && !function.IsEmptyMap(containerInfo.HostConfig.PortBindings) {
 		for destPort, bindings := range containerInfo.HostConfig.PortBindings {
 			if function.IsEmptyArray(bindings) {
@@ -296,7 +333,14 @@ func (self Container) Copy(http *gin.Context) {
 		self.JsonResponseWithError(http, err, 500)
 		return
 	}
-	_ = docker.Sdk.Client.ContainerStart(docker.Sdk.Ctx, params.CopyName, container.StartOptions{})
+
+	if params.EnableStart {
+		err = docker.Sdk.Client.ContainerStart(docker.Sdk.Ctx, params.CopyName, container.StartOptions{})
+		if err != nil {
+			self.JsonResponseWithError(http, err, 500)
+			return
+		}
+	}
 
 	self.JsonResponseWithoutError(http, gin.H{
 		"containerId": out.ID,
@@ -330,7 +374,22 @@ func (self Container) Delete(http *gin.Context) {
 	var err error
 	containerInfo, err := docker.Sdk.Client.ContainerInspect(docker.Sdk.Ctx, params.Md5)
 	if err != nil {
-		self.JsonResponseWithError(http, err, 500)
+		// 如果查找不到容器信息，可能是有错误的容器，强制删除
+		err = docker.Sdk.Client.ContainerStop(docker.Sdk.Ctx, params.Md5, container.StopOptions{})
+		if err != nil {
+			slog.Warn("container delete not info container", "error", err)
+		}
+		err = docker.Sdk.Client.ContainerRemove(docker.Sdk.Ctx, params.Md5, container.RemoveOptions{
+			Force: true,
+		})
+		if err != nil {
+			slog.Warn("container delete not info container", "error", err)
+			self.JsonResponseWithError(http, function.ErrorMessage(define.ErrorMessageCommonDataNotFoundOrDeleted), 500)
+			return
+		}
+		self.JsonResponseWithoutError(http, gin.H{
+			"md5": params.Md5,
+		})
 		return
 	}
 	runOption, err := logic.Site{}.GetEnvOptionByContainer(params.Md5)
@@ -363,12 +422,18 @@ func (self Container) Delete(http *gin.Context) {
 		}
 	}
 	_ = dao.Site.Save(siteRow)
+
+	// 如果存在 site 数据，则只保留最后一条
+	_, _ = dao.Site.Unscoped().Where(gen.Cond(
+		datatypes.JSONQuery("env").Equals(docker.Sdk.Name, "dockerEnvName"),
+	)...).Where(dao.Site.SiteName.Eq(siteRow.SiteName)).Where(dao.Site.DeletedAt.IsNotNull()).Delete()
+
 	// 删除域名、配置、证书
 	domainList, _ := dao.SiteDomain.Where(dao.SiteDomain.ContainerID.Eq(containerInfo.Name)).Find()
 	for _, domain := range domainList {
-		err = os.Remove(filepath.Join(storage.Local{}.GetNginxSettingPath(), fmt.Sprintf(logic.VhostFileName, domain.ServerName)))
+		err = os.Remove(storage.Local{}.GetNginxSettingFilePath(domain.Setting.VHostFilename()))
 		if err != nil {
-			slog.Debug("container delete domain", "error", err)
+			slog.Warn("container delete domain", "error", err)
 		}
 	}
 
@@ -406,7 +471,7 @@ func (self Container) Delete(http *gin.Context) {
 			if item.Type == mount.TypeVolume {
 				err = docker.Sdk.Client.VolumeRemove(docker.Sdk.Ctx, item.Name, false)
 				if err != nil {
-					slog.Debug("remove container volume", err.Error())
+					slog.Warn("remove container volume", "error", err.Error())
 				}
 			}
 		}
@@ -433,14 +498,20 @@ func (self Container) Delete(http *gin.Context) {
 
 func (self Container) Export(http *gin.Context) {
 	type ParamsValidate struct {
-		Md5 string `json:"md5" binding:"required"`
+		Md5                  string `json:"md5"`
+		EnableExportToPath   bool   `json:"enableExportToPath"`
+		EnableExportCompress bool   `json:"enableExportCompress"`
 	}
 	params := ParamsValidate{}
 	if !self.Validate(http, &params) {
 		return
 	}
-
-	out, err := docker.Sdk.Client.ContainerExport(docker.Sdk.Ctx, params.Md5)
+	containerInfo, err := docker.Sdk.Client.ContainerInspect(docker.Sdk.Ctx, params.Md5)
+	if err != nil {
+		self.JsonResponseWithError(http, err, 500)
+		return
+	}
+	out, err := docker.Sdk.Client.ContainerExport(docker.Sdk.Ctx, containerInfo.ID)
 	if err != nil {
 		self.JsonResponseWithError(http, err, 500)
 		return
@@ -448,16 +519,52 @@ func (self Container) Export(http *gin.Context) {
 	defer func() {
 		_ = out.Close()
 	}()
-
-	data, err := io.ReadAll(out)
+	fileName := strings.Trim(containerInfo.Name, "/") + "-" + time.Now().Format(define.DateYmdHis) + ".tar"
+	if params.EnableExportCompress {
+		fileName += ".zst"
+	}
+	exportSaveFile, err := storage.Local{}.CreateSaveFile("export/container/" + fileName)
 	if err != nil {
 		self.JsonResponseWithError(http, err, 500)
 		return
 	}
-	http.Header("Content-Type", "application/tar")
-	http.Header("Content-Disposition", "attachment; filename="+params.Md5+".tar")
-	http.Data(200, "application/tar", data)
-	return
+	defer func() {
+		_ = exportSaveFile.Close()
+	}()
+	if params.EnableExportCompress {
+		compression := archives.Zstd{}
+		cw, err := compression.OpenWriter(exportSaveFile)
+		if err != nil {
+			self.JsonResponseWithError(http, err, 500)
+			return
+		}
+		defer func() {
+			_ = cw.Close()
+		}()
+		_, err = io.Copy(cw, out)
+	} else {
+		_, err = io.Copy(exportSaveFile, out)
+		if err != nil {
+			self.JsonResponseWithError(http, err, 500)
+			return
+		}
+	}
+
+	if params.EnableExportToPath {
+		self.JsonResponseWithoutError(http, gin.H{
+			"saveUrl": exportSaveFile.Name(),
+		})
+		return
+	}
+	downloadUrl, err := logic2.Attach{}.PreDownload(exportSaveFile.Name(), cache.DefaultExpiration)
+	if err != nil {
+		self.JsonResponseWithError(http, err, 500)
+		return
+	}
+	self.JsonResponseWithoutError(http, gin.H{
+		"saveUrl":     exportSaveFile.Name(),
+		"downloadUrl": downloadUrl,
+	})
 }
 
 func (self Container) Commit(http *gin.Context) {

@@ -1,12 +1,10 @@
 package common
 
 import (
+	"strings"
+
 	"github.com/gin-gonic/gin"
 	"github.com/we7coreteam/w7-rangine-go/v2/src/http/middleware"
-	http2 "net/http"
-	"strconv"
-	"strings"
-	"time"
 )
 
 type CacheMiddleware struct {
@@ -14,11 +12,11 @@ type CacheMiddleware struct {
 }
 
 func (self CacheMiddleware) Process(http *gin.Context) {
-	if strings.HasPrefix(http.Request.URL.Path, "/dpanel/static") {
-		defaultMaxAge := 604800
-		http.Writer.Header().Add("Cache-Control", "public, max-age="+strconv.Itoa(defaultMaxAge))
-		http.Writer.Header().Add("Expires", time.Now().Add(time.Duration(defaultMaxAge)*time.Second).UTC().Format(http2.TimeFormat))
-		http.Writer.WriteHeader(304)
+	url := http.Request.URL.Path
+	if strings.HasPrefix(url, "/dpanel/static") || strings.HasPrefix(url, "/favicon.ico") {
+		http.Header("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0")
+		http.Header("Pragma", "no-cache")
+		http.Header("Expires", "0")
 	}
 	http.Next()
 	return

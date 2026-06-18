@@ -1,38 +1,51 @@
 package controller
 
 import (
+	"bytes"
 	"context"
+	"embed"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
+	http2 "net/http"
+	"os"
+	"runtime"
+	"runtime/debug"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/creack/pty"
+	"github.com/docker/docker/api"
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/network"
+	applicationLogic "github.com/donknap/dpanel/app/application/logic"
 	"github.com/donknap/dpanel/app/common/logic"
 	"github.com/donknap/dpanel/common/accessor"
 	"github.com/donknap/dpanel/common/dao"
 	"github.com/donknap/dpanel/common/entity"
 	"github.com/donknap/dpanel/common/function"
 	"github.com/donknap/dpanel/common/service/docker"
-	"github.com/donknap/dpanel/common/service/exec"
+	types2 "github.com/donknap/dpanel/common/service/docker/types"
+	"github.com/donknap/dpanel/common/service/exec/local"
 	"github.com/donknap/dpanel/common/service/notice"
 	"github.com/donknap/dpanel/common/service/plugin"
-	"github.com/donknap/dpanel/common/service/registry"
 	"github.com/donknap/dpanel/common/service/ssh"
+	"github.com/donknap/dpanel/common/service/storage"
 	"github.com/donknap/dpanel/common/service/ws"
+	"github.com/donknap/dpanel/common/types/define"
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
-	"github.com/mcuadros/go-version"
 	"github.com/we7coreteam/w7-rangine-go/v2/pkg/support/facade"
 	"github.com/we7coreteam/w7-rangine-go/v2/src/http/controller"
 	ssh2 "golang.org/x/crypto/ssh"
-	"io"
-	"log/slog"
-	"os"
-	"sort"
-	"strconv"
-	"strings"
-	"time"
+	"gorm.io/datatypes"
+	"gorm.io/gen"
 )
 
 type command struct {
@@ -50,8 +63,31 @@ type Home struct {
 	controller.Abstract
 }
 
-func (self Home) Index(ctx *gin.Context) {
-	self.JsonResponseWithoutError(ctx, "hello world!")
+func (self Home) Index(http *gin.Context) {
+	uri := http.Request.URL.String()
+	slog.Debug("http route not found", "ip", http.ClientIP(), "user-agent", http.Request.Header.Get("User-Agent"), "uri", uri)
+	var asset embed.FS
+	if v, ok := storage.Cache.Get(storage.CacheKeyAsset); ok {
+		asset = v.(embed.FS)
+	} else {
+		self.JsonResponseWithError(http, function.ErrorMessage(define.ErrorMessageUnknow, "error", define.ErrorAssetEmpty.Error()), 500)
+		return
+	}
+	// 如果没发现语言包返回默认的英文，并提示用户
+	if strings.HasPrefix(uri, "/dpanel/static/asset/i18n") {
+		enUs, _ := asset.ReadFile("asset/static/i18n/en-US.json")
+		http.Data(http2.StatusOK, "application/json; charset=UTF-8", enUs)
+		return
+	}
+
+	indexHtml, _ := asset.ReadFile("asset/static/index.html")
+	for o, n := range map[string]string{
+		"/favicon.ico": function.RouterUri("/favicon.ico"),
+		"/dpanel":      function.RouterUri("/dpanel"),
+	} {
+		indexHtml = bytes.ReplaceAll(indexHtml, []byte(o), []byte(n))
+	}
+	http.Data(http2.StatusOK, "text/html; charset=UTF-8", indexHtml)
 	return
 }
 
@@ -74,7 +110,7 @@ func (self Home) WsNotice(http *gin.Context) {
 		Data: client.Fd,
 	})
 	if err != nil {
-		slog.Error("websocket", "connect", err.Error())
+		slog.Warn("websocket", "connect", err.Error())
 	}
 }
 
@@ -84,17 +120,23 @@ func (self Home) WsContainerConsole(http *gin.Context) {
 		return
 	}
 	type ParamsValidate struct {
-		Id      string `uri:"id" binding:"required"`
-		Width   uint   `form:"width"`
-		Height  uint   `form:"height"`
-		Cmd     string `form:"cmd,default=/bin/sh"`
-		WorkDir string `form:"workDir"`
+		Id      string `json:"id" uri:"id" binding:"required"`
+		Width   uint   `json:"width"`
+		Height  uint   `json:"height"`
+		Cmd     string `json:"cmd"`
+		WorkDir string `json:"workDir"`
 	}
 	params := ParamsValidate{}
 	if !self.Validate(http, &params) {
 		return
 	}
-
+	params.Cmd = strings.TrimSpace(params.Cmd)
+	if params.Cmd == "" {
+		params.Cmd = "/bin/sh"
+	}
+	if params.Cmd == "bin/sh" || params.Cmd == "bin/bash" {
+		params.Cmd = "/" + params.Cmd
+	}
 	containerName := params.Id
 	if _, pluginName, exists := strings.Cut(params.Id, ":"); exists {
 		containerName = pluginName
@@ -112,16 +154,16 @@ func (self Home) WsContainerConsole(http *gin.Context) {
 			var cmd command
 			err = json.Unmarshal(recvMessage.Message, &cmd)
 			if err != nil {
-				slog.Error("console", "json unmarshal", err.Error())
+				slog.Warn("console", "json unmarshal", err.Error())
 			}
 			if shell.Conn == nil {
-				slog.Debug("console", "shell is nil", err.Error())
+				slog.Warn("console", "shell is nil", err.Error())
 				return
 			}
 			if cmd.Content.Command != "" {
 				_, err = shell.Conn.Write([]byte(cmd.Content.Command))
 				if err != nil {
-					slog.Error("console", "shell read", err.Error())
+					slog.Warn("console", "shell read", err.Error())
 				}
 			}
 			if cmd.Size.Height > 0 && cmd.Size.Width > 0 {
@@ -130,7 +172,7 @@ func (self Home) WsContainerConsole(http *gin.Context) {
 					Width:  uint(cmd.Size.Width),
 				})
 				if err != nil {
-					slog.Warn("console", "container tty resize", cmd.Size, "err", err)
+					slog.Warn("console container tty", "resize", cmd.Size, "error", err)
 				}
 			}
 		}),
@@ -139,6 +181,12 @@ func (self Home) WsContainerConsole(http *gin.Context) {
 		self.JsonResponseWithError(http, err, 500)
 		return
 	}
+	clientReady := false
+	defer func() {
+		if !clientReady {
+			_ = client.Close()
+		}
+	}()
 	go func() {
 		select {
 		case <-client.CtxContext.Done():
@@ -178,6 +226,7 @@ func (self Home) WsContainerConsole(http *gin.Context) {
 		return
 	}
 
+	clientReady = true
 	go client.ReadMessage()
 	go func() {
 		out := make([]byte, 2028)
@@ -191,30 +240,29 @@ func (self Home) WsContainerConsole(http *gin.Context) {
 				Data: string(out[:n]),
 			})
 			if err != nil {
-				slog.Error("websocket", "shell write", err.Error())
+				slog.Warn("websocket shell write", "error", err.Error())
 				return
 			}
 		}
 	}()
 }
 
-func (self Home) WsHostConsole(http *gin.Context) {
+func (self Home) WsSshConsole(http *gin.Context) {
 	if !websocket.IsWebSocketUpgrade(http.Request) {
-		self.JsonResponseWithError(http, function.ErrorMessage(".commonUseWsConnect"), 500)
+		self.JsonResponseWithError(http, function.ErrorMessage(define.ErrorMessageCommonUseWsConnect), 500)
 		return
 	}
 	type ParamsValidate struct {
-		Name   string `uri:"name" binding:"required"`
-		Width  int    `form:"width"`
-		Height int    `form:"height"`
-		Cmd    string `form:"cmd,default=/bin/sh"`
+		Name   string `json:"name" uri:"name" binding:"required"`
+		Width  int    `json:"width"`
+		Height int    `json:"height"`
 	}
 	params := ParamsValidate{}
 	if !self.Validate(http, &params) {
 		return
 	}
 	if params.Name == "" {
-		params.Name = docker.DefaultClientName
+		params.Name = define.DockerDefaultClientName
 	}
 	var err error
 	var sshClient *ssh.Client
@@ -222,18 +270,18 @@ func (self Home) WsHostConsole(http *gin.Context) {
 	var write io.WriteCloser
 	var session *ssh2.Session
 
-	messageType := fmt.Sprintf(ws.MessageTypeConsoleHost, params.Name)
+	messageType := fmt.Sprintf(ws.MessageTypeConsoleSsh, params.Name)
 	client, err := ws.NewClient(http,
 		ws.WithMessageRecvHandler(messageType, func(recvMessage *ws.RecvMessage) {
 			var cmd command
 			err = json.Unmarshal(recvMessage.Message, &cmd)
 			if err != nil {
-				slog.Error("console", "json unmarshal", err.Error())
+				slog.Warn("console", "json unmarshal", err.Error())
 			}
 			if cmd.Content.Command != "" {
 				_, err = write.Write([]byte(cmd.Content.Command))
 				if err != nil {
-					slog.Error("console", "json unmarshal", err.Error())
+					slog.Warn("console", "json unmarshal", err.Error())
 				}
 			}
 			if cmd.Size.Width > 0 && cmd.Size.Height > 0 {
@@ -248,14 +296,20 @@ func (self Home) WsHostConsole(http *gin.Context) {
 		self.JsonResponseWithError(http, err, 500)
 		return
 	}
+	clientReady := false
+	defer func() {
+		if !clientReady {
+			_ = client.Close()
+		}
+	}()
 
 	err = func() error {
-		dockerEnv, err := logic.Setting{}.GetDockerClient(params.Name)
+		dockerEnv, err := logic.Env{}.GetEnvByName(params.Name)
 		if err != nil {
 			return err
 		}
-		if !dockerEnv.EnableSSH {
-			return function.ErrorMessage(".homeWsHostConsoleSshNotSetting")
+		if !dockerEnv.EnableSSH || dockerEnv.SshServerInfo == nil {
+			return function.ErrorMessage(define.ErrorMessageHomeWsHostConsoleSshNotSetting)
 		}
 		sshClient, err = ssh.NewClient(ssh.WithServerInfo(dockerEnv.SshServerInfo)...)
 		if err != nil {
@@ -276,6 +330,7 @@ func (self Home) WsHostConsole(http *gin.Context) {
 		return
 	}
 
+	clientReady = true
 	go func() {
 		out := make([]byte, 2028)
 		for {
@@ -288,7 +343,7 @@ func (self Home) WsHostConsole(http *gin.Context) {
 				Data: string(out[:n]),
 			})
 			if err != nil {
-				slog.Error("websocket", "shell write", err.Error())
+				slog.Warn("websocket", "shell write", err.Error())
 				return
 			}
 		}
@@ -307,62 +362,209 @@ func (self Home) WsHostConsole(http *gin.Context) {
 	go client.ReadMessage()
 }
 
-func (self Home) Info(http *gin.Context) {
-	startTime := time.Now()
-	dpanelContainerInfo := container.InspectResponse{}
-	new(logic.Setting).GetByKey(logic.SettingGroupSetting, logic.SettingGroupSettingDPanelInfo, &dpanelContainerInfo)
-	slog.Debug("dpanel info time", "use", time.Now().Sub(startTime).String())
-
-	startTime = time.Now()
-	info, err := docker.Sdk.Client.Info(docker.Sdk.Ctx)
-	if err == nil && info.ID != "" {
-		info.Name = fmt.Sprintf("%s - %s", docker.Sdk.Name, docker.Sdk.Client.DaemonHost())
+func (self Home) WsShellConsole(http *gin.Context) {
+	if !websocket.IsWebSocketUpgrade(http.Request) {
+		self.JsonResponseWithError(http, function.ErrorMessage(define.ErrorMessageCommonUseWsConnect), 500)
+		return
 	}
-	slog.Debug("docker info time", "use", time.Now().Sub(startTime).String())
+	type ParamsValidate struct {
+		Width  int `json:"width"`
+		Height int `json:"height"`
+	}
+	params := ParamsValidate{}
+	if !self.Validate(http, &params) {
+		return
+	}
 
-	self.JsonResponseWithoutError(http, gin.H{
-		"info":       info,
-		"sdkVersion": docker.Sdk.Client.ClientVersion(),
-		"dpanel": map[string]interface{}{
-			"version":       facade.GetConfig().GetString("app.version"),
-			"family":        facade.GetConfig().GetString("app.family"),
-			"env":           facade.GetConfig().GetString("app.env"),
-			"containerInfo": dpanelContainerInfo,
-		},
-		"plugin": plugin.Wrapper{}.GetPluginList(),
+	var err error
+	var read io.Reader
+	var write io.WriteCloser
+	var closeTerminalOnce sync.Once
+	var resizeTerminal func(size *pty.Winsize) error
+
+	client, err := ws.NewClient(http,
+		ws.WithMessageRecvHandler(ws.MessageTypeConsoleShell, func(recvMessage *ws.RecvMessage) {
+			var cmd command
+			err = json.Unmarshal(recvMessage.Message, &cmd)
+			if err != nil {
+				slog.Warn("console", "json unmarshal", err.Error())
+			}
+			if cmd.Content.Command != "" {
+				_, err = write.Write([]byte(cmd.Content.Command))
+				if err != nil {
+					slog.Warn("console shell write", "error", err.Error())
+				}
+			}
+			if resizeTerminal != nil && cmd.Size.Width > 0 && cmd.Size.Height > 0 {
+				err = resizeTerminal(&pty.Winsize{
+					Rows: uint16(cmd.Size.Height),
+					Cols: uint16(cmd.Size.Width),
+				})
+				if err != nil {
+					slog.Warn("console shell resize", "size", cmd.Size, "error", err)
+				}
+			}
+		}),
+	)
+	if err != nil {
+		self.JsonResponseWithError(http, err, 500)
+		return
+	}
+	clientReady := false
+	defer func() {
+		if !clientReady {
+			_ = client.Close()
+		}
+	}()
+
+	localCmd, err := local.New(
+		local.WithDefaultShell(),
+		local.WithDefaultShellDir(),
+		local.WithInteractiveTerminalEnv(),
+		local.WithCtx(client.CtxContext),
+		// pty.StartWithSize already sets Setsid and Setctty; adding Setpgid can make fork/exec fail with EPERM.
+		local.WithKillProcessGroupOnCancel(),
+	)
+	if err != nil {
+		_ = client.SendMessage(&ws.RespMessage{
+			Type: ws.MessageTypeConsoleShell,
+			Data: err.Error(),
+		})
+		return
+	}
+	read, write, err = localCmd.RunInTerminal(&pty.Winsize{
+		Rows: uint16(params.Height),
+		Cols: uint16(params.Width),
 	})
-	return
+	if err != nil {
+		_ = client.SendMessage(&ws.RespMessage{
+			Type: ws.MessageTypeConsoleShell,
+			Data: err.Error(),
+		})
+		return
+	}
+	if resizer, ok := localCmd.(interface {
+		ResizeTerminal(size *pty.Winsize) error
+	}); ok {
+		resizeTerminal = resizer.ResizeTerminal
+	}
+
+	closeTerminal := func() {
+		closeTerminalOnce.Do(func() {
+			if write != nil {
+				_ = write.Close()
+			}
+		})
+	}
+
+	clientReady = true
+	go func() {
+		select {
+		case <-client.CtxContext.Done():
+			closeTerminal()
+			return
+		}
+	}()
+
+	go func() {
+		defer closeTerminal()
+		out := make([]byte, 2028)
+		for {
+			n, err := read.Read(out)
+			if err != nil {
+				return
+			}
+			err = client.SendMessage(&ws.RespMessage{
+				Type: ws.MessageTypeConsoleShell,
+				Data: string(out[:n]),
+			})
+			if err != nil {
+				slog.Warn("websocket shell write", "error", err.Error())
+				return
+			}
+		}
+	}()
+
+	go client.ReadMessage()
 }
 
-func (self Home) CheckNewVersion(http *gin.Context) {
-	var tags []string
-	var err error
-	currentVersion := facade.GetConfig().GetString("app.version")
-	newVersion := ""
+func (self Home) ConsoleLink(http *gin.Context) {
+	params := accessor.ConsoleInstance{}
+	if http.Request.ContentLength != 0 && !self.Validate(http, &params) {
+		return
+	}
 
-	for _, s := range []string{
-		"registry.cn-hangzhou.aliyuncs.com",
-	} {
-		option := make([]registry.Option, 0)
-		option = append(option, registry.WithRequestCacheTime(time.Hour*24))
-		option = append(option, registry.WithRegistryHost(s))
-		reg := registry.New(option...)
-		tags, err = reg.Repository.GetImageTagList("dpanel/dpanel")
-		if err == nil {
-			break
+	if params.Host == nil && params.Container == nil {
+		logic.Setting{}.GetByKey(logic.SettingGroupSetting, logic.SettingGroupSettingConsoleInstance, &params)
+	} else {
+		if params.Host == nil {
+			params.Host = make([]string, 0)
+		}
+		if params.Container == nil {
+			params.Container = make([]string, 0)
+		}
+		err := logic.Setting{}.Save(&entity.Setting{
+			GroupName: logic.SettingGroupSetting,
+			Name:      logic.SettingGroupSettingConsoleInstance,
+			Value: &accessor.SettingValueOption{
+				ConsoleInstance: &params,
+			},
+		})
+		if err != nil {
+			self.JsonResponseWithError(http, err, 500)
+			return
 		}
 	}
 
-	for _, ver := range tags {
-		if !strings.Contains(ver, "-") && version.Compare(ver, currentVersion, ">") {
-			newVersion = ver
-			break
+	if params.Host == nil {
+		params.Host = make([]string, 0)
+	}
+	if params.Container == nil {
+		params.Container = make([]string, 0)
+	}
+	self.JsonResponseWithoutError(http, params)
+}
+
+func (self Home) Info(http *gin.Context) {
+	info, err := docker.Sdk.Client.Info(docker.Sdk.Ctx)
+	if err == nil && info.ID != "" {
+		info.Name = fmt.Sprintf("%s - %s", docker.Sdk.Name, docker.Sdk.DockerEnv.Address)
+	}
+	var public string
+	if v, ok := storage.Cache.Get(storage.CacheKeyRsaPub); ok {
+		public = string(v.([]byte))
+	}
+	dpanelInfo := logic.Setting{}.GetDPanelInfo()
+	var containerInfo gin.H
+	if dpanelInfo.ContainerInfo.ContainerJSONBase != nil {
+		containerInfo = gin.H{
+			"Id":   dpanelInfo.ContainerInfo.ID,
+			"Name": dpanelInfo.ContainerInfo.Name,
+			"HostConfig": gin.H{
+				"NetworkMode": dpanelInfo.ContainerInfo.HostConfig.NetworkMode,
+			},
 		}
 	}
+
+	dockerEnv := *docker.Sdk.DockerEnv
+	dockerEnv.SshServerInfo = nil
+	dockerEnv.TlsCert = ""
+	dockerEnv.TlsCa = ""
+	dockerEnv.TlsKey = ""
+
+	dpanelInfoResult := function.StructToMap(dpanelInfo)
+	dpanelInfoResult["containerInfo"] = containerInfo
 
 	self.JsonResponseWithoutError(http, gin.H{
-		"version":    currentVersion,
-		"newVersion": newVersion,
+		"info":          info,
+		"clientVersion": docker.Sdk.Client.ClientVersion(),
+		"sdkVersion":    api.DefaultVersion,
+		"dpanel":        dpanelInfoResult,
+		"dockerEnv":     dockerEnv,
+		"plugin":        plugin.Wrapper{}.GetPluginList(),
+		"rsa": gin.H{
+			"public": public,
+		},
 	})
 	return
 }
@@ -370,7 +572,13 @@ func (self Home) CheckNewVersion(http *gin.Context) {
 func (self Home) Usage(http *gin.Context) {
 	// 有些设备的docker获取磁盘占用比较耗时，跑一下后台协程去获取数据
 	go func() {
-		diskUsage, err := docker.Sdk.Client.DiskUsage(docker.Sdk.Ctx, types.DiskUsageOptions{
+		progress, err := ws.NewFdProgressPip(http, ws.MessageTypeDiskUsage)
+		defer func() {
+			progress.Close()
+		}()
+		// 20 分种后强制终止
+		ctx, _ := context.WithTimeout(docker.Sdk.Ctx, time.Minute*20)
+		diskUsage, err := docker.Sdk.Client.DiskUsage(ctx, types.DiskUsageOptions{
 			Types: []types.DiskUsageObject{
 				types.ContainerObject,
 				types.ImageObject,
@@ -414,10 +622,17 @@ func (self Home) Usage(http *gin.Context) {
 				Name:      logic.SettingGroupSettingDiskUsage,
 				Value: &accessor.SettingValueOption{
 					DiskUsage: &accessor.DiskUsage{
-						Usage:     &diskUsage,
-						UpdatedAt: time.Now(),
+						DockerEnvName: docker.Sdk.Name,
+						Usage:         &diskUsage,
+						UpdatedAt:     time.Now(),
 					},
 				},
+			})
+
+			time.Sleep(time.Second * 3)
+			progress.BroadcastMessage(&accessor.DiskUsage{
+				Usage:     &diskUsage,
+				UpdatedAt: time.Now(),
 			})
 		}
 		return
@@ -427,14 +642,19 @@ func (self Home) Usage(http *gin.Context) {
 		Usage: &types.DiskUsage{},
 	}
 	logic.Setting{}.GetByKey(logic.SettingGroupSetting, logic.SettingGroupSettingDiskUsage, &diskUsage)
+	if diskUsage.DockerEnvName != docker.Sdk.Name {
+		// 用量统计如果不是当前环境的变清空掉，等待获取
+		diskUsage = accessor.DiskUsage{
+			Usage: &types.DiskUsage{},
+		}
+	}
+
 	type portItem struct {
-		Port docker.PortItem `json:"port"`
+		Port types2.PortItem `json:"port"`
 		Name string          `json:"name"`
 	}
 	ports := make([]*portItem, 0)
-	containerList, err := docker.Sdk.Client.ContainerList(docker.Sdk.Ctx, container.ListOptions{
-		All: true,
-	})
+
 	containerRunningTotal := struct {
 		Stop      int `json:"stop"`
 		Pause     int `json:"pause"`
@@ -444,8 +664,16 @@ func (self Home) Usage(http *gin.Context) {
 		Pause:     0,
 		Unhealthy: 0,
 	}
-	if err == nil {
+
+	var containerList []container.Summary
+	var err error
+
+	if containerList, err = docker.Sdk.Client.ContainerList(docker.Sdk.Ctx, container.ListOptions{
+		All: true,
+	}); err == nil {
+		containerLogic := applicationLogic.Container{}
 		for _, item := range containerList {
+			unhealthy := false
 			if item.State == "exited" {
 				containerRunningTotal.Stop += 1
 			}
@@ -454,11 +682,30 @@ func (self Home) Usage(http *gin.Context) {
 			}
 			if strings.Contains(item.Status, "unhealthy") {
 				containerRunningTotal.Unhealthy += 1
+				unhealthy = true
+			}
+			if strings.Contains(item.Status, "Restarting") {
+				containerRunningTotal.Unhealthy += 1
+				unhealthy = true
+			}
+			var containerInfo container.InspectResponse
+			var inspectInfo *container.InspectResponse
+			containerInspectOK := false
+			if info, err := docker.Sdk.Client.ContainerInspect(docker.Sdk.Ctx, item.ID); err == nil {
+				containerInfo = info
+				inspectInfo = &containerInfo
+				containerInspectOK = true
+			}
+			if !unhealthy && containerLogic.RuntimeStatus(applicationLogic.ContainerRuntimeItem{
+				Summary: item,
+				Inspect: inspectInfo,
+			}).Unhealthy {
+				containerRunningTotal.Unhealthy += 1
 			}
 			usePort := make([]*portItem, 0)
 			if function.IsEmptyArray(item.Ports) {
-				if info, err := docker.Sdk.Client.ContainerInspect(docker.Sdk.Ctx, item.ID); err == nil && info.HostConfig != nil && !function.IsEmptyMap(info.HostConfig.PortBindings) {
-					for port, bindings := range info.HostConfig.PortBindings {
+				if containerInspectOK && containerInfo.HostConfig != nil && !function.IsEmptyMap(containerInfo.HostConfig.PortBindings) {
+					for port, bindings := range containerInfo.HostConfig.PortBindings {
 						for _, binding := range bindings {
 							hostPort, _ := strconv.Atoi(binding.HostPort)
 							if binding.HostIP == "" {
@@ -466,7 +713,7 @@ func (self Home) Usage(http *gin.Context) {
 							}
 							usePort = append(usePort, &portItem{
 								Name: item.Names[0],
-								Port: docker.PortItem{
+								Port: types2.PortItem{
 									Host:     strconv.Itoa(hostPort),
 									Dest:     strconv.Itoa(port.Int()),
 									HostIp:   binding.HostIP,
@@ -483,7 +730,7 @@ func (self Home) Usage(http *gin.Context) {
 					}
 					usePort = append(usePort, &portItem{
 						Name: item.Names[0],
-						Port: docker.PortItem{
+						Port: types2.PortItem{
 							Host:   strconv.Itoa(int(port.PublicPort)),
 							Dest:   strconv.Itoa(int(port.PrivatePort)),
 							HostIp: port.IP,
@@ -499,8 +746,20 @@ func (self Home) Usage(http *gin.Context) {
 	}
 
 	networkRow, _ := docker.Sdk.Client.NetworkList(docker.Sdk.Ctx, network.ListOptions{})
-	containerTask, _ := dao.Site.Where(dao.Site.DeletedAt.IsNotNull()).Unscoped().Count()
-	imageTask, _ := dao.Image.Count()
+	recycleQuery := dao.Site.Where(dao.Site.DeletedAt.IsNotNull()).Unscoped().Where(gen.Cond(
+		datatypes.JSONQuery("env").Equals(docker.Sdk.Name, "dockerEnvName"),
+	)...)
+	if containerList != nil {
+		names := make([]string, 0)
+		for _, summary := range containerList {
+			for _, name := range summary.Names {
+				names = append(names, strings.TrimPrefix(name, "/"))
+			}
+		}
+		recycleQuery = recycleQuery.Where(dao.Site.SiteName.NotIn(names...))
+	}
+	containerTask, _ := recycleQuery.Count()
+	imageTask, _ := dao.Image.Where(dao.Image.Setting.IsNotNull()).Count()
 	backupData, _ := dao.Backup.Count()
 
 	self.JsonResponseWithoutError(http, gin.H{
@@ -526,25 +785,9 @@ func (self Home) GetStatList(http *gin.Context) {
 		return
 	}
 	var err error
-	command := []string{
-		"stats", "-a",
-		"--format", "json",
-	}
-	option := make([]exec.Option, 0)
+
 	if !params.Follow {
-		ctx, cancel := context.WithCancel(context.Background())
-		defer func() {
-			cancel()
-		}()
-		command = append(command, "--no-stream")
-		option = append(option, docker.Sdk.GetRunCmd(command...)...)
-		option = append(option, exec.WithCtx(ctx))
-		cmd, err := exec.New(option...)
-		if err != nil {
-			self.JsonResponseWithError(http, err, 500)
-			return
-		}
-		list, err := logic.Stat{}.GetStat(cmd.RunWithResult())
+		list, err := docker.Sdk.ContainerStatsOneShot(docker.Sdk.Ctx)
 		if err != nil {
 			self.JsonResponseWithError(http, err, 500)
 			return
@@ -560,7 +803,8 @@ func (self Home) GetStatList(http *gin.Context) {
 		self.JsonResponseWithError(http, err, 500)
 		return
 	}
-	time.AfterFunc(time.Hour, func() {
+
+	closeTimer := time.AfterFunc(time.Hour, func() {
 		progress.Close()
 	})
 
@@ -571,88 +815,76 @@ func (self Home) GetStatList(http *gin.Context) {
 		return
 	}
 	defer progress.Close()
-	lastSendTime := time.Now()
-	progress.OnWrite = func(p string) error {
-		if p == "" {
-			return nil
-		}
-		list, err := logic.Stat{}.GetStat(p)
-		if err != nil {
-			return err
-		}
-		if function.IsEmptyArray(list) {
-			return nil
-		}
-		if time.Now().Sub(lastSendTime) > 2*time.Second {
+
+	out, err := docker.Sdk.ContainerStats(progress.Context(), types2.ContainerStatsOption{
+		Stream: true,
+	})
+	if err != nil {
+		slog.Debug("home get stat list", "error", err)
+		self.JsonResponseWithoutError(http, gin.H{
+			"list": "",
+		})
+		return
+	}
+
+	for {
+		select {
+		case <-docker.Sdk.Ctx.Done():
+			progress.Close()
+		case <-progress.Done():
+			slog.Debug("home get stat list progress done")
+			closeTimer.Stop()
+			self.JsonResponseWithoutError(http, gin.H{
+				"list": "",
+			})
+			return
+		case list, ok := <-out:
+			if !ok {
+				// 关闭通道继续执行，正常回收资源
+				progress.Close()
+				continue
+			}
 			progress.BroadcastMessage(list)
-			lastSendTime = time.Now()
 		}
-		return nil
 	}
-	ctx, _ := context.WithTimeout(progress.Context(), time.Hour*1)
-	option = append(option, docker.Sdk.GetRunCmd(command...)...)
-	option = append(option, exec.WithCtx(ctx))
-	cmd, err := exec.New(option...)
-	if err != nil {
-		self.JsonResponseWithError(http, err, 500)
-		return
-	}
-	go func() {
-		slog.Debug("home get stat list progress close")
-		<-progress.Done()
-		cmd.Close()
-	}()
-	out, err := cmd.RunInPip()
-	if err != nil {
-		self.JsonResponseWithError(http, err, 500)
-		return
-	}
-	slog.Debug("home get stat list cmd start", "cmd", cmd, "pid", cmd.Cmd().Process.Pid)
-	_, err = io.Copy(progress, out)
-	if err != nil {
-		self.JsonResponseWithError(http, err, 500)
-		return
-	}
-	// 等待进程退出
-	err = cmd.Cmd().Wait()
-	if err != nil {
-		slog.Warn("home stat wait process", "error", err)
-	}
-	self.JsonResponseWithoutError(http, gin.H{
-		"list": "",
-	})
-	return
 }
 
-func (self Home) UpgradeScript(http *gin.Context) {
-	dpanelContainerInfo := container.InspectResponse{}
-	new(logic.Setting).GetByKey(logic.SettingGroupSetting, logic.SettingGroupSettingDPanelInfo, &dpanelContainerInfo)
-	execPath, _ := os.Executable()
-	self.JsonResponseWithoutError(http, gin.H{
-		"info":     dpanelContainerInfo,
-		"execPath": execPath,
-	})
-	return
-}
-
-func (self Home) EmailTest(http *gin.Context) {
+func (self Home) Prune(http *gin.Context) {
 	type ParamsValidate struct {
-		Subject string `json:"subject" binding:"required"`
-		Content string `json:"content" binding:"required"`
+		EnableNotice   bool `json:"enableNotice"`
+		EnableTempFile bool `json:"enableTempFile"`
 	}
 	params := ParamsValidate{}
 	if !self.Validate(http, &params) {
 		return
 	}
-	emailServer := accessor.EmailServer{}
-	if ok := (logic.Setting{}).GetByKey(logic.SettingGroupSetting, logic.SettingGroupSettingEmailServer, &emailServer); !ok {
-		self.JsonResponseWithError(http, function.ErrorMessage(".settingBasicEmailInvalid"), 500)
-		return
+	total := 0
+	var eventTotal int64
+	var noticeTotal int64
+
+	if params.EnableNotice {
+		if oldRow, _ := dao.Notice.Last(); oldRow != nil {
+			query := dao.Notice.Where(dao.Notice.ID.Lte(oldRow.ID))
+			noticeTotal, _ = query.Count()
+			_, _ = query.Delete()
+		}
+		if db, err := facade.GetDbFactory().Channel("default"); err == nil {
+			db.Exec("vacuum")
+		}
 	}
-	err := logic.Notice{}.Send(emailServer, emailServer.Email, params.Subject, params.Content)
-	if err != nil {
-		self.JsonResponseWithError(http, function.ErrorMessage(".settingBasicEmailInvalid", err.Error()), 500)
-		return
+
+	if params.EnableTempFile {
+		_ = os.RemoveAll(storage.Local{}.GetLocalTempDir())
 	}
-	self.JsonSuccessResponse(http)
+
+	runtime.GC()
+	debug.FreeOSMemory()
+
+	self.JsonResponseWithoutError(http, gin.H{
+		"gc":     true,
+		"temp":   total,
+		"events": eventTotal,
+		"notice": noticeTotal,
+	})
+	return
 }

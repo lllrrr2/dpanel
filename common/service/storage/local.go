@@ -1,20 +1,24 @@
 package storage
 
 import (
+	"errors"
 	"fmt"
-	"github.com/donknap/dpanel/common/function"
-	"github.com/donknap/dpanel/common/service/acme"
-	"github.com/we7coreteam/w7-rangine-go/v2/pkg/support/facade"
 	"log/slog"
 	"os"
 	"path/filepath"
+
+	"github.com/donknap/dpanel/common/function"
+	"github.com/donknap/dpanel/common/service/acme"
+	"github.com/donknap/dpanel/common/types/define"
+	"github.com/google/uuid"
+	"github.com/we7coreteam/w7-rangine-go/v2/pkg/support/facade"
 )
 
 type Local struct {
 }
 
 func (self Local) Delete(name string) error {
-	err := os.Remove(self.GetRealPath(name))
+	err := os.Remove(self.GetSaveRealPath(name))
 	return err
 }
 
@@ -22,16 +26,27 @@ func (self Local) GetSaveRootPath() string {
 	return filepath.Join(self.GetStorageLocalPath(), "storage")
 }
 
-func (self Local) GetRealPath(name string) string {
-	return filepath.Join(self.GetStorageLocalPath(), "storage", name)
+func (self Local) GetSaveRealPath(name string) string {
+	return function.SafePathJoin(self.GetSaveRootPath(), name)
 }
 
-func (self Local) GetStorageCertPath() string {
+func (self Local) GetCertPath() string {
 	return filepath.Join(self.GetStorageLocalPath(), "cert")
 }
 
-func (self Local) GetComposePath() string {
-	return filepath.Join(self.GetStorageLocalPath(), "compose")
+func (self Local) GetCertDomainPath() string {
+	if override := os.Getenv(acme.EnvOverrideConfigHome); override != "" {
+		return override
+	}
+	return fmt.Sprintf("%s/acme/", self.GetStorageLocalPath())
+}
+
+func (self Local) GetComposePath(prefix string) string {
+	if prefix == "" || prefix == define.DockerDefaultClientName {
+		return filepath.Join(self.GetStorageLocalPath(), "compose")
+	} else {
+		return filepath.Join(self.GetStorageLocalPath(), "compose-"+prefix)
+	}
 }
 
 func (self Local) GetStorePath() string {
@@ -42,8 +57,8 @@ func (self Local) GetLicenseFilePath() string {
 	return filepath.Join(self.GetStorageLocalPath(), "dpanel.lic")
 }
 
-func (self Local) GetSshKnownHostsPath() string {
-	return filepath.Join(self.GetStorageLocalPath(), "known_hosts")
+func (self Local) GetW7OpenSoftwareLicenseFilePath() string {
+	return filepath.Join(self.GetStorageLocalPath(), "w7_opensoftware.enc")
 }
 
 func (self Local) GetScriptTemplatePath() string {
@@ -56,10 +71,27 @@ func (self Local) GetBackupPath() string {
 
 func (self Local) GetLocalProxySockPath() string {
 	path := filepath.Join(self.GetStorageLocalPath(), "sock")
-	if _, err := os.Stat(path); err != nil {
-		_ = os.MkdirAll(path, os.ModePerm)
-	}
 	return path
+}
+
+func (self Local) GetNginxSettingPath() string {
+	return fmt.Sprintf("%s/nginx/proxy_host/", self.GetStorageLocalPath())
+}
+
+func (self Local) GetNginxSettingFilePath(fileName string) string {
+	return function.SafePathJoin(self.GetNginxSettingPath(), fileName)
+}
+
+func (self Local) GetNginxExtraSettingPath() string {
+	return fmt.Sprintf("%s/nginx/extra_host/", self.GetStorageLocalPath())
+}
+
+func (self Local) GetNginxExtraSettingFilePath(fileName string) string {
+	return function.SafePathJoin(self.GetNginxExtraSettingPath(), fileName)
+}
+
+func (self Local) GetComposeProjectPath(dockerEnvName string, projectName string) string {
+	return function.SafePathJoin(self.GetComposePath(dockerEnvName), projectName)
 }
 
 func (self Local) GetStorageLocalPath() string {
@@ -67,38 +99,53 @@ func (self Local) GetStorageLocalPath() string {
 		slog.Debug("storage local path empty")
 		return ""
 	}
-	path := facade.GetConfig().GetString("storage.local.path")
-	if path == "" {
-		panic("storage.local.path empty")
+	if v := facade.GetConfig().GetString("system.storage.local.path"); v == "" {
+		panic("invalid local storage path")
+	} else {
+		return v
 	}
-	return facade.GetConfig().GetString("storage.local.path")
 }
 
-func (self Local) GetNginxSettingPath() string {
-	return fmt.Sprintf("%s/nginx/proxy_host/", self.GetStorageLocalPath())
+func (self Local) CreateSaveFile(name string) (*os.File, error) {
+	f := filepath.Join(self.GetSaveRootPath(), name)
+	_ = os.MkdirAll(filepath.Dir(f), os.ModePerm)
+	return os.Create(f)
 }
 
-func (self Local) GetNginxCertPath() string {
-	if override := os.Getenv(acme.EnvOverrideConfigHome); override != "" {
-		return override
+func (self Local) GetLocalTempDir() string {
+	p := filepath.Join(self.GetSaveRootPath(), "temp")
+	if _, err := os.Stat(p); errors.Is(err, os.ErrNotExist) {
+		_ = os.MkdirAll(p, os.ModePerm)
 	}
-	return fmt.Sprintf("%s/cert/", self.GetStorageLocalPath())
+	return p
+}
+
+func (self Local) GetTempFile(name string) (file *os.File, path string, err error) {
+	tempFilePath := filepath.Join(self.GetLocalTempDir(), name)
+	_, err = os.Stat(tempFilePath)
+	if err != nil {
+		return nil, "", err
+	}
+	file, err = os.OpenFile(tempFilePath, os.O_RDWR, os.ModePerm)
+	if err != nil {
+		return nil, "", err
+	}
+	return file, file.Name(), err
 }
 
 func (self Local) CreateTempFile(name string) (*os.File, error) {
 	if name == "" {
-		return os.CreateTemp(self.GetSaveRootPath(), "dpanel-temp-")
+		return os.CreateTemp(self.GetLocalTempDir(), "dpanel-temp-")
 	}
-	_ = os.MkdirAll(filepath.Dir(filepath.Join(self.GetSaveRootPath(), name)), os.ModePerm)
-	return os.Create(filepath.Join(self.GetSaveRootPath(), name))
+	return os.Create(filepath.Join(self.GetLocalTempDir(), name))
 }
 
 func (self Local) CreateTempDir(name string) (string, error) {
 	if name == "" {
-		return os.MkdirTemp(self.GetSaveRootPath(), "dpanel-temp-")
+		return os.MkdirTemp(self.GetLocalTempDir(), "dpanel-temp-")
 	}
 	name = fmt.Sprintf("dpanel-temp-%s", name)
-	path := filepath.Join(self.GetSaveRootPath(), name)
+	path := filepath.Join(self.GetLocalTempDir(), name)
 	if _, err := os.Stat(path); err == nil {
 		_ = os.RemoveAll(path)
 	}
@@ -116,16 +163,19 @@ func (self Local) SaveUploadImage(uploadFileName, newFileNamePrefix string, appe
 	}
 	var newFileName string
 	if appendRandomString {
-		newFileName = fmt.Sprintf("%s-%s.png", newFileNamePrefix, function.GetRandomString(5))
+		newFileName = fmt.Sprintf("%s-%s.png", newFileNamePrefix, uuid.New().String()[24:])
 	} else {
 		newFileName = fmt.Sprintf("%s.png", newFileNamePrefix)
 	}
 
 	newBgFile := filepath.Join(rootPath, newFileName)
 	_ = os.MkdirAll(filepath.Dir(newBgFile), 0777)
-	_ = os.Rename(
+	err := os.Rename(
 		uploadFileName,
 		newBgFile,
 	)
+	if err != nil {
+		slog.Debug("save upload image fail", "error", err)
+	}
 	return "/dpanel/static/image/" + newFileName
 }

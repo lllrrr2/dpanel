@@ -2,12 +2,15 @@ package event
 
 import (
 	"context"
+
 	"github.com/docker/docker/api/types/container"
 )
 
-var ContainerCreateEvent = "container_create"
-var ContainerDeleteEvent = "container_delete"
-var ContainerEditEvent = "container_edit"
+const (
+	ContainerCreateEvent = "container_create"
+	ContainerDeleteEvent = "container_delete"
+	ContainerEditEvent   = "container_edit"
+)
 
 type ContainerPayload struct {
 	InspectInfo    *container.InspectResponse

@@ -1,0 +1,56 @@
+services:
+  dpanel-plugin-explorer:
+    image: dpanel/explorer
+    container_name: dpanel-plugin-explorer
+    restart: "no"
+    privileged: true
+    pid: host
+    labels:
+      - "com.dpanel.container.title=DPanel-文件管理助手"
+      - "com.dpanel.container.auto_remove=true"
+      - "com.dpanel.container.hash={{.hash}}"
+      - "com.dpanel.container.name=dpanel-plugin-explorer"
+#{{- if .volumes }}
+    volumes:
+#{{- range $item := .volumes }}
+      - {{ $item.host }}:{{ $item.dest }}
+#{{- end }}
+#{{- end }}
+#{{- if .workingDir }}
+    working_dir: {{.workingDir}}
+#{{- end }}
+    x-dpanel-service:
+      image_tar:
+        amd64: asset/plugin/dpanel-plugin-explorer/image-amd64.tar
+        arm64: asset/plugin/dpanel-plugin-explorer/image-arm64.tar
+        arm: asset/plugin/dpanel-plugin-explorer/image-arm.tar
+      image_auto_remove: true
+      external:
+#{{- if .external.volumes }}
+        volumes:
+#{{- range $key, $val := .external.volumes }}
+          - {{ $val }}
+#{{- end }}
+#{{- end }}
+#{{- if .external.volumes_from }}
+        volumes_from:
+#{{- range $key, $val := .external.volumes_from }}
+          - {{ $val }}
+#{{- end }}
+#{{- end }}
+
+#{{- $hasNamedVolume := false }}
+#{{- range $item := .volumes }}
+#{{- if eq $item.type "volume" }}
+#{{- $hasNamedVolume = true }}
+#{{- end }}
+#{{- end }}
+
+#{{- if $hasNamedVolume }}
+volumes:
+#{{- range $item := .volumes }}
+#{{- if eq $item.type "volume" }}
+  {{ $item.host }}: {}
+#{{- end }}
+#{{- end }}
+#{{- end }}

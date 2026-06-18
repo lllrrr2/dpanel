@@ -3,6 +3,7 @@ package function
 import (
 	"cmp"
 	"reflect"
+	"sort"
 )
 
 func IsEmptyArray[T interface{}](v []T) bool {
@@ -40,20 +41,20 @@ func InArrayArray[T cmp.Ordered](v []T, item ...T) bool {
 }
 
 func InArrayWalk[T interface{}](v []T, walk func(i T) bool) bool {
-	exists, _ := IndexArrayWalk(v, walk)
-	return exists
+	_, ok := IndexArrayWalk(v, walk)
+	return ok
 }
 
-func IndexArrayWalk[T interface{}](v []T, walk func(i T) bool) (exists bool, index int) {
+func IndexArrayWalk[T interface{}](v []T, walk func(i T) bool) (index int, ok bool) {
 	if v == nil {
-		return false, 0
+		return 0, false
 	}
 	for i, t := range v {
 		if walk(t) {
-			return true, i
+			return i, true
 		}
 	}
-	return false, 0
+	return 0, false
 }
 
 func PluckArrayWalk[T interface{}, R interface{}](v []T, walk func(i T) (R, bool)) []R {
@@ -62,6 +63,26 @@ func PluckArrayWalk[T interface{}, R interface{}](v []T, walk func(i T) (R, bool
 		newItem, ok := walk(item)
 		if ok {
 			result = append(result, newItem)
+		}
+	}
+	return result
+}
+
+func PluckArrayItemWalk[T interface{}](v []T, walk func(item T) bool) (T, int, bool) {
+	var result T
+	for i, item := range v {
+		if ok := walk(item); ok {
+			return item, i, true
+		}
+	}
+	return result, 0, false
+}
+
+func PluckArrayMapWalk[T interface{}, K comparable, V interface{}](v []T, walk func(item T) (K, V, bool)) map[K]V {
+	result := make(map[K]V)
+	for _, item := range v {
+		if key, value, ok := walk(item); ok {
+			result[key] = value
 		}
 	}
 	return result
@@ -117,4 +138,29 @@ func FindArrayValueIndex(items interface{}, value ...interface{}) (exists bool, 
 	} else {
 		return false, nil
 	}
+}
+
+func CombinedArrayValueCount[T cmp.Ordered](v []T, callback func(key T, count int)) map[T]int {
+	nbByStatus := map[T]int{}
+	keys := make([]T, 0)
+	for _, status := range v {
+		nb, ok := nbByStatus[status]
+		if !ok {
+			nb = 0
+			keys = append(keys, status)
+		}
+		nbByStatus[status] = nb + 1
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		return keys[i] < keys[j]
+	})
+
+	for _, key := range keys {
+		nb := nbByStatus[key]
+		if callback != nil {
+			callback(key, nb)
+		}
+	}
+
+	return nbByStatus
 }

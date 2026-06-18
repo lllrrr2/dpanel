@@ -1,0 +1,116 @@
+package function
+
+import (
+	"fmt"
+	"io/fs"
+	"path"
+	"path/filepath"
+	"runtime"
+	"strings"
+
+	"github.com/compose-spec/compose-go/v2/paths"
+)
+
+// PathConvertWinPath2Unix 转换 windows 路径 c:\\my\\path\\shiny 为 /c/my/path/shiny
+func PathConvertWinPath2Unix(p string) (string, bool) {
+	if !paths.IsWindowsAbs(p) {
+		return p, false
+	}
+	pathName, pathValue, ok := strings.Cut(p, ":\\")
+	if !ok {
+		// 再尝试用 d:/ 来切割
+		pathName, pathValue, ok = strings.Cut(p, ":/")
+		if !ok {
+			return p, false
+		}
+	}
+	convertedSource := fmt.Sprintf("/%s/%s", strings.ToLower(pathName), strings.ReplaceAll(pathValue, "\\", "/"))
+	return path.Clean(convertedSource), true
+}
+
+// SystemPathFromSlash 传入类 linux 风格路径，返回当前系统可用路径。
+func SystemPathFromSlash(p string) string {
+	if p == "" {
+		return "."
+	}
+	if len(p) < 2 {
+		return filepath.Clean(p)
+	}
+	p = filepath.ToSlash(p)
+	if runtime.GOOS == "windows" && p[0] == '/' {
+		// 无论 /d/abc 还是 /d，统一处理
+		// 核心逻辑：取第2位作为盘符，拼接冒号，再接剩下的部分
+		if len(p) == 2 {
+			p = string(p[1]) + ":/"
+		} else if p[2] == '/' {
+			p = string(p[1]) + ":" + p[2:]
+		}
+		// Windows 没办法清除路径
+		return p
+	} else {
+		return PathClean(filepath.FromSlash(p))
+	}
+}
+
+func PathClean(p string) string {
+	var sb strings.Builder
+	lastWasDash := false
+
+	// 1. 白名单过滤：仅允许安全字符通过，非法字符（如空格、&、|、" 等）替换为 '-'
+	for _, r := range p {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') ||
+			r == '/' || r == '\\' || r == ':' || r == '.' || r == '_' || r == '@' {
+			sb.WriteRune(r)
+			lastWasDash = false
+		} else if r == '-' {
+			if !lastWasDash {
+				sb.WriteRune(r)
+				lastWasDash = true
+			}
+		} else {
+			// 将不在白名单中的危险/非法字符统一替换为 '-'
+			if !lastWasDash {
+				sb.WriteRune('-')
+				lastWasDash = true
+			}
+		}
+	}
+
+	cleaned := sb.String()
+
+	if len(cleaned) > 1 {
+		cleaned = strings.TrimRight(cleaned, "-")
+	}
+
+	for strings.Contains(cleaned, "..") {
+		cleaned = strings.ReplaceAll(cleaned, "..", "")
+	}
+
+	if strings.HasPrefix(cleaned, "./") {
+		cleaned = strings.TrimPrefix(cleaned, "./")
+	}
+
+	if cleaned == "" {
+		return "."
+	}
+
+	return cleaned
+}
+
+func PathSize(p string) (int64, error) {
+	var size int64
+
+	err := filepath.WalkDir(p, func(walkPath string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !d.IsDir() {
+			info, err := d.Info()
+			if err == nil {
+				size += info.Size()
+			}
+		}
+		return nil
+	})
+	return size, err
+}

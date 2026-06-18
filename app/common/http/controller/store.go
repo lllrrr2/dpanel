@@ -1,29 +1,33 @@
 package controller
 
 import (
-	"errors"
 	"fmt"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
 	"github.com/docker/docker/api/types/network"
+	logic2 "github.com/donknap/dpanel/app/application/logic"
 	"github.com/donknap/dpanel/app/common/logic"
+	"github.com/donknap/dpanel/app/common/logic/baota"
+	"github.com/donknap/dpanel/app/common/logic/onepanel"
 	"github.com/donknap/dpanel/common/accessor"
 	"github.com/donknap/dpanel/common/dao"
 	"github.com/donknap/dpanel/common/entity"
 	"github.com/donknap/dpanel/common/function"
 	"github.com/donknap/dpanel/common/service/compose"
 	"github.com/donknap/dpanel/common/service/docker"
+	"github.com/donknap/dpanel/common/service/docker/types"
+	"github.com/donknap/dpanel/common/service/exec/local"
 	"github.com/donknap/dpanel/common/service/notice"
 	"github.com/donknap/dpanel/common/service/storage"
+	"github.com/donknap/dpanel/common/types/define"
 	"github.com/donknap/dpanel/common/types/event"
 	"github.com/gin-gonic/gin"
 	"github.com/we7coreteam/w7-rangine-go/v2/pkg/support/facade"
 	"github.com/we7coreteam/w7-rangine-go/v2/src/http/controller"
-	"gorm.io/datatypes"
-	"gorm.io/gen"
-	"log/slog"
-	"os"
-	"path/filepath"
-	"strings"
-	"time"
 )
 
 type Store struct {
@@ -47,13 +51,13 @@ func (self Store) Create(http *gin.Context) {
 	if params.Id <= 0 {
 		storeRow, _ := dao.Store.Where(dao.Store.Name.Eq(params.Name)).First()
 		if storeRow != nil {
-			self.JsonResponseWithError(http, function.ErrorMessage(".commonIdAlreadyExists", "name", params.Name), 500)
+			self.JsonResponseWithError(http, function.ErrorMessage(define.ErrorMessageCommonIdAlreadyExists, "name", params.Name), 500)
 			return
 		}
 	} else {
 		storeRow, _ := dao.Store.Where(dao.Store.ID.Eq(params.Id)).First()
 		if storeRow == nil {
-			self.JsonResponseWithError(http, function.ErrorMessage(".commonDataNotFoundOrDeleted"), 500)
+			self.JsonResponseWithError(http, function.ErrorMessage(define.ErrorMessageCommonDataNotFoundOrDeleted), 500)
 			return
 		}
 	}
@@ -97,10 +101,13 @@ func (self Store) Delete(http *gin.Context) {
 	for _, id := range params.Id {
 		storeRow, _ := dao.Store.Where(dao.Store.ID.Eq(id)).First()
 		if storeRow == nil {
-			self.JsonResponseWithError(http, function.ErrorMessage(".commonDataNotFoundOrDeleted"), 500)
+			self.JsonResponseWithError(http, function.ErrorMessage(define.ErrorMessageCommonDataNotFoundOrDeleted), 500)
 			return
 		}
-		err := os.RemoveAll(filepath.Join(storage.Local{}.GetStorePath(), storeRow.Name))
+		err := function.SafeDeleteAll(
+			storage.Local{}.GetStorePath(),
+			storeRow.Name,
+		)
 		if err != nil {
 			self.JsonResponseWithError(http, err, 500)
 			return
@@ -123,8 +130,9 @@ func (self Store) Delete(http *gin.Context) {
 
 func (self Store) GetList(http *gin.Context) {
 	type ParamsValidate struct {
-		Title string `json:"title"`
-		Name  string `json:"name"`
+		Title         string `json:"title"`
+		Name          string `json:"name"`
+		EnableAppList bool   `json:"enableAppList"`
 	}
 	params := ParamsValidate{}
 	if !self.Validate(http, &params) {
@@ -144,12 +152,20 @@ func (self Store) GetList(http *gin.Context) {
 
 	// 如果是本地商店，同步一遍数据
 	for _, item := range list {
-		if item.Setting.Type == accessor.StoreTypeOnePanelLocal {
+		item.Setting.Total = len(item.Setting.Apps)
+		if item.Setting.Type == define.StoreTypeOnePanelLocal {
 			if appList, err := (logic.Store{}).GetAppByOnePanel(item.Name); err == nil {
 				item.Setting.Apps = appList
 				_ = dao.Store.Save(item)
 			}
 		}
+	}
+
+	if !params.EnableAppList {
+		list = function.PluckArrayWalk(list, func(item *entity.Store) (*entity.Store, bool) {
+			item.Setting.Apps = make([]accessor.StoreAppItem, 0)
+			return item, true
+		})
 	}
 
 	self.JsonResponseWithoutError(http, gin.H{
@@ -171,16 +187,19 @@ func (self Store) Sync(http *gin.Context) {
 	}
 	var err error
 
-	storeRootPath := filepath.Join(storage.Local{}.GetStorePath(), params.Name)
-	if _, err = os.Stat(storeRootPath); err != nil && params.Type == accessor.StoreTypeOnePanelLocal {
+	storeRootPath := function.SafePathJoin(storage.Local{}.GetStorePath(), params.Name)
+	if _, err = os.Stat(storeRootPath); err != nil && params.Type == define.StoreTypeOnePanelLocal {
 		_ = os.MkdirAll(filepath.Join(storeRootPath, "apps"), os.ModePerm)
 	}
 
 	appList := make([]accessor.StoreAppItem, 0)
-	if params.Type == accessor.StoreTypeOnePanel || params.Type == accessor.StoreTypeOnePanelLocal {
-		if params.Type == accessor.StoreTypeOnePanel {
-			err = logic.Store{}.SyncByGit(storeRootPath, params.Url)
+	if params.Type == define.StoreTypeOnePanel || params.Type == define.StoreTypeOnePanelLocal {
+		if params.Type == define.StoreTypeOnePanel {
+			err = logic.Store{}.SyncByGit(params.Url, logic.SyncByGitOption{
+				TargetPath: storeRootPath,
+			})
 			if err != nil {
+				_ = notice.Message{}.Error(".gitPullEarlyEOF", "name", params.Name, "url", params.Url)
 				self.JsonResponseWithError(http, err, 500)
 				return
 			}
@@ -190,7 +209,7 @@ func (self Store) Sync(http *gin.Context) {
 			self.JsonResponseWithError(http, err, 500)
 			return
 		}
-	} else if params.Type == accessor.StoreTypeCasaOs {
+	} else if params.Type == define.StoreTypeCasaOs {
 		err = logic.Store{}.SyncByZip(storeRootPath, params.Url, "Apps")
 		if err != nil {
 			self.JsonResponseWithError(http, err, 500)
@@ -201,8 +220,15 @@ func (self Store) Sync(http *gin.Context) {
 			self.JsonResponseWithError(http, err, 500)
 			return
 		}
-	} else if params.Type == accessor.StoreTypePortainer {
-		err = logic.Store{}.SyncByJson(storeRootPath, params.Url)
+	} else if params.Type == define.StoreTypePortainer {
+		jsonPath := filepath.Join(storeRootPath, "template.json")
+		err = logic.Store{}.SyncByUrl(jsonPath, params.Url)
+		if err != nil {
+			self.JsonResponseWithError(http, err, 500)
+			return
+		}
+	} else if params.Type == define.StoreTypeBaoTa {
+		appList, err = logic.Store{}.GetAppByBaoTa(params.Name, params.Url)
 		if err != nil {
 			self.JsonResponseWithError(http, err, 500)
 			return
@@ -227,89 +253,127 @@ func (self Store) Sync(http *gin.Context) {
 
 func (self Store) Deploy(http *gin.Context) {
 	type ParamsValidate struct {
-		StoreId     int32            `json:"storeId" binding:"required"`
-		Name        string           `json:"name"`
-		AppName     string           `json:"appName"`
-		Title       string           `json:"title"`
-		ComposeFile string           `json:"composeFile" binding:"required"`
-		Environment []docker.EnvItem `json:"environment"`
+		StoreId     int32                        `json:"storeId" binding:"required"`
+		TaskName    string                       `json:"taskName"`
+		AppName     string                       `json:"appName"`
+		AppTitle    string                       `json:"appTitle"`
+		VersionInfo accessor.StoreAppVersionItem `json:"versionInfo"`
 	}
 	params := ParamsValidate{}
 	if !self.Validate(http, &params) {
 		return
 	}
+
 	storeRow, err := dao.Store.Where(dao.Store.ID.Eq(params.StoreId)).First()
 	if storeRow == nil {
-		slog.Debug("sto deploy get store", "error", err)
-		self.JsonResponseWithError(http, notice.Message{}.New(".commonDataNotFoundOrDeleted"), 500)
+		slog.Debug("store deploy get store", "error", err)
+		self.JsonResponseWithError(http, function.ErrorMessage(define.ErrorMessageCommonDataNotFoundOrDeleted), 500)
 		return
 	}
 
-	if storeRow.Setting.Type == accessor.StoreTypeOnePanel {
-		if _, err := docker.Sdk.Client.NetworkInspect(docker.Sdk.Ctx, "1panel-network", network.InspectOptions{}); err != nil {
-			if _, err = docker.Sdk.Client.NetworkCreate(docker.Sdk.Ctx, "1panel-network", network.CreateOptions{}); err != nil {
+	composeYamlRealPath := function.SafePathJoin(storage.Local{}.GetStorePath(), params.VersionInfo.ComposeFile)
+
+	// 创建私有网络
+	if v, ok := map[string]string{
+		define.StoreTypeOnePanel:      define.StoreTypeOnePanelNetwork,
+		define.StoreTypeBaoTa:         define.StoreTypeBaoTaNetwork,
+		define.StoreTypeOnePanelLocal: define.StoreTypeOnePanelNetwork,
+	}[storeRow.Setting.Type]; ok {
+		if _, err := docker.Sdk.Client.NetworkInspect(docker.Sdk.Ctx, v, network.InspectOptions{}); err != nil {
+			if _, err = docker.Sdk.Client.NetworkCreate(docker.Sdk.Ctx, v, network.CreateOptions{}); err != nil {
 				self.JsonResponseWithError(http, err, 500)
 				return
 			}
 		}
 	}
 
-	envReplaceTable := compose.NewReplaceTable(
-		func(item *docker.EnvItem) error {
-			if !strings.Contains(item.Value, compose.CurrentUsername) {
-				return nil
-			}
-			if data, ok := http.Get("userInfo"); ok {
-				if userInfo, ok := data.(logic.UserInfo); ok {
-					item.Value = userInfo.Username
-					return nil
-				}
-			}
-			return errors.New("not found userinfo")
-		},
-	)
-
-	if strings.Contains(params.Name, compose.CurrentDate) {
-		temp := docker.EnvItem{
-			Value: params.Name,
+	// 适配 1panel
+	if storeRow.Setting.Type == define.StoreTypeOnePanel || storeRow.Setting.Type == define.StoreTypeOnePanelLocal {
+		if v, ok := onepanel.DefaultEnv[params.AppName]; ok {
+			params.VersionInfo.Environment = append(params.VersionInfo.Environment, v...)
 		}
-		if err = envReplaceTable.Replace(&temp); err == nil {
-			params.Name = temp.Value
+		// docker 29 容器名称变量变为严格判断不能为空
+		params.VersionInfo.Environment = append(params.VersionInfo.Environment, onepanel.CommonEnv[define.StoreEnvContainerName])
+	}
+
+	// 适配 bt
+	if storeRow.Setting.Type == define.StoreTypeBaoTa {
+		params.VersionInfo.Environment = function.PluckArrayWalk(params.VersionInfo.Environment, func(item types.EnvItem) (types.EnvItem, bool) {
+			if find, _, ok := function.PluckMapItemWalk(baota.CommonEnv, func(k int, v types.EnvItem) bool {
+				return v.Name == item.Name
+			}); ok {
+				item.Value = find.Value
+				if item.Rule == nil {
+					item.Rule = &types.EnvValueRule{}
+				}
+				item.Rule.Kind |= find.Rule.Kind
+				item.Rule.Option = find.Rule.Option
+			}
+			return item, true
+		})
+		// 下载数据
+		err := logic.Store{}.SyncByZip(filepath.Dir(filepath.Dir(composeYamlRealPath)), params.VersionInfo.Download, params.AppName)
+		if err != nil {
+			self.JsonResponseWithError(http, err, 500)
+			return
 		}
 	}
 
-	params.Name = strings.ToLower(params.Name)
-	total, err := dao.Compose.Where(dao.Compose.Name.Eq(params.Name)).Where(gen.Cond(datatypes.JSONQuery("setting").Equals(docker.Sdk.Name, "dockerEnvName"))...).Count()
-	if total != 0 {
-		self.JsonResponseWithError(http, notice.Message{}.New(".storeCreateNameExists", "name", params.Name), 500)
+	valueReplaceTable := function.NewReplacerTable(compose.ValueReplaceTable...)
+	valueReplaceTable = append(valueReplaceTable, func(v *string) {
+		*v = function.StringReplaceAll(*v, compose.PlaceholderAppTaskName, params.TaskName)
+	})
+	valueReplaceTable = append(valueReplaceTable, func(v *string) {
+		*v = function.StringReplaceAll(*v, compose.PlaceholderAppName, params.AppName)
+	})
+	valueReplaceTable = append(valueReplaceTable, func(v *string) {
+		*v = function.StringReplaceAll(*v, compose.PlaceholderAppVersion, params.VersionInfo.Name)
+	})
+	valueReplaceTable = append(valueReplaceTable, func(v *string) {
+		if data, ok := http.Get("userInfo"); ok {
+			if userInfo, ok := data.(logic.UserInfo); ok {
+				*v = function.StringReplaceAll(*v, compose.PlaceholderCurrentUsername, userInfo.Username)
+				return
+			}
+		}
+	})
+	function.Placeholder(&params.TaskName, valueReplaceTable...)
+
+	envReplaceTable := function.NewReplacerTable(compose.EnvItemReplaceTable...)
+	envReplaceTable = append(envReplaceTable, func(v *types.EnvItem) {
+		function.Placeholder(&v.Value, valueReplaceTable...)
+		return
+	})
+	for i, item := range params.VersionInfo.Environment {
+		function.Placeholder(&item, envReplaceTable...)
+		params.VersionInfo.Environment[i] = item
+	}
+
+	runComposeList := logic2.Compose{}.Ls()
+	if _, _, ok := function.PluckArrayItemWalk(runComposeList, func(item *compose.ProjectResult) bool {
+		return item.Name == params.TaskName
+	}); ok {
+		self.JsonResponseWithError(http, function.ErrorMessage(define.ErrorMessageCommonIdAlreadyExists, "name", params.TaskName), 500)
 		return
 	}
 
-	for i, item := range params.Environment {
-		if err := envReplaceTable.Replace(&item); err == nil {
-			params.Environment[i] = item
-		} else {
-			slog.Debug("store replace env", "error", err)
-		}
-	}
-
 	composeNew := &entity.Compose{
-		Name:  params.Name,
-		Title: params.Title,
+		Name:  strings.ToLower(params.TaskName),
+		Title: params.AppTitle,
 		Setting: &accessor.ComposeSettingOption{
 			Type:        accessor.ComposeTypeStore,
-			Store:       fmt.Sprintf("%s@%s@%s", storeRow.Title, storeRow.Setting.Url, params.AppName),
-			Environment: params.Environment,
+			Store:       fmt.Sprintf("%s:%s@%s@%s", storeRow.Setting.Type, storeRow.Title, storeRow.Setting.Url, params.AppName),
+			Environment: params.VersionInfo.Environment,
 			Uri: []string{
-				filepath.Join(params.Name, filepath.Base(params.ComposeFile)),
+				filepath.Join(function.SafeFileName(params.TaskName), filepath.Base(params.VersionInfo.ComposeFile)),
 			},
-			DockerEnvName: docker.DefaultClientName,
+			DockerEnvName: docker.Sdk.Name,
 		},
 	}
-	targetPath := filepath.Join(storage.Local{}.GetComposePath(), params.Name)
-	if dockerClient, err := new(logic.Setting).GetDockerClient(docker.Sdk.Name); err == nil && dockerClient.EnableComposePath {
-		targetPath = filepath.Join(filepath.Dir(storage.Local{}.GetComposePath()), "compose-"+dockerClient.Name, params.Name)
-		composeNew.Setting.DockerEnvName = dockerClient.Name
+
+	targetPath := storage.Local{}.GetComposeProjectPath("", params.TaskName)
+	if docker.Sdk.DockerEnv.EnableComposePath {
+		targetPath = storage.Local{}.GetComposeProjectPath(docker.Sdk.Name, params.TaskName)
 	}
 
 	err = dao.Compose.Create(composeNew)
@@ -318,10 +382,27 @@ func (self Store) Deploy(http *gin.Context) {
 		return
 	}
 
-	err = os.CopyFS(targetPath, os.DirFS(filepath.Join(storage.Local{}.GetStorePath(), filepath.Dir(params.ComposeFile))))
+	err = function.CopyDir(targetPath, filepath.Dir(composeYamlRealPath))
 	if err != nil {
 		self.JsonResponseWithError(http, err, 500)
 		return
+	}
+
+	// 适配 1panel
+	if storeRow.Setting.Type == define.StoreTypeOnePanel || storeRow.Setting.Type == define.StoreTypeOnePanelLocal {
+		initScript := filepath.Join(targetPath, "scripts", "init.sh")
+		if _, err := os.Stat(initScript); err == nil {
+			if cmd, err := local.New(
+				local.WithCommandName("sh"),
+				local.WithArgs(initScript),
+				local.WithDir(targetPath),
+			); err == nil {
+				err = cmd.Run()
+				if err != nil {
+					slog.Debug("store deploy run init.sh", "error", err)
+				}
+			}
+		}
 	}
 
 	facade.GetEvent().Publish(event.ComposeCreateEvent, event.ComposePayload{

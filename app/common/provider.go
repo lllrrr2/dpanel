@@ -1,44 +1,43 @@
 package common
 
 import (
-	"context"
-	"github.com/docker/docker/client"
-	"github.com/donknap/dpanel/app/common/http/controller"
-	"github.com/donknap/dpanel/app/common/logic"
-	"github.com/donknap/dpanel/common/accessor"
-	"github.com/donknap/dpanel/common/dao"
-	"github.com/donknap/dpanel/common/entity"
-	"github.com/donknap/dpanel/common/function"
-	common "github.com/donknap/dpanel/common/middleware"
-	"github.com/donknap/dpanel/common/service/crontab"
-	"github.com/donknap/dpanel/common/service/docker"
-	"github.com/donknap/dpanel/common/service/family"
-	"github.com/donknap/dpanel/common/types"
-	"github.com/gin-gonic/gin"
-	"github.com/robfig/cron/v3"
-	"github.com/we7coreteam/w7-rangine-go/v2/pkg/support/facade"
-	http_server "github.com/we7coreteam/w7-rangine-go/v2/src/http/server"
 	"log/slog"
 	"net/http"
 	"os"
-	"time"
+
+	"github.com/donknap/dpanel/app/common/events"
+	"github.com/donknap/dpanel/app/common/http/controller"
+	"github.com/donknap/dpanel/app/common/logic"
+	"github.com/donknap/dpanel/common/dao"
+	"github.com/donknap/dpanel/common/function"
+	common "github.com/donknap/dpanel/common/middleware"
+	"github.com/donknap/dpanel/common/service/crontab"
+	types2 "github.com/donknap/dpanel/common/service/docker/types"
+	"github.com/donknap/dpanel/common/service/family"
+	"github.com/donknap/dpanel/common/service/notice"
+	"github.com/donknap/dpanel/common/types"
+	"github.com/donknap/dpanel/common/types/event"
+	"github.com/gin-gonic/gin"
+	"github.com/robfig/cron/v3"
+	"github.com/we7coreteam/w7-rangine-go/v2/pkg/support/facade"
+	httpserver "github.com/we7coreteam/w7-rangine-go/v2/src/http/server"
 )
 
 type Provider struct {
 }
 
-func (provider *Provider) Register(httpServer *http_server.Server) {
+func (provider *Provider) Register(httpServer *httpserver.Server) {
 	httpServer.RegisterRouters(func(engine *gin.Engine) {
-		cors := engine.Group("/api", common.CorsMiddleware{}.Process)
+		cors := engine.Group(function.RouterRootApi(), common.CorsMiddleware{}.Process)
 
 		cors.POST("/common/attach/upload", controller.Attach{}.Upload)
 		cors.POST("/common/attach/delete", controller.Attach{}.Delete)
+		cors.GET("/common/attach/download", controller.Attach{}.Download)
 
 		// 仓库相关
 		cors.POST("/common/registry/create", controller.Registry{}.Create)
 		cors.POST("/common/registry/get-list", controller.Registry{}.GetList)
 		cors.POST("/common/registry/get-detail", controller.Registry{}.GetDetail)
-		cors.POST("/common/registry/update", controller.Registry{}.Update)
 		cors.POST("/common/registry/delete", controller.Registry{}.Delete)
 
 		// 全局
@@ -50,9 +49,16 @@ func (provider *Provider) Register(httpServer *http_server.Server) {
 		cors.POST("/common/notice/delete", controller.Notice{}.Delete)
 
 		// 用户
-		if !function.InArrayArray(new(family.Provider).Feature(), types.FeatureFamilyXk) {
+		feature := new(family.Provider).Feature()
+		if !function.InArrayArray(feature, types.FeatureFamilyXk) {
 			cors.POST("/common/user/login", controller.User{}.Login)
 		}
+
+		if !function.InArrayArray(feature, types.FeatureFamilyXk) {
+			cors.POST("/common/user/oauth/callback", controller.User{}.OauthCallback)
+		}
+		cors.POST("/common/user/oauth/providers", controller.User{}.OauthProviders)
+		cors.GET("/common/user/oauth/authorize", controller.User{}.OauthAuthorize)
 		cors.POST("/common/user/create-founder", controller.User{}.CreateFounder)
 		cors.POST("/common/user/login-info", controller.User{}.LoginInfo)
 		cors.POST("/common/user/get-user-info", controller.User{}.GetUserInfo)
@@ -61,13 +67,17 @@ func (provider *Provider) Register(httpServer *http_server.Server) {
 		cors.POST("/common/setting/founder", controller.Setting{}.Founder)
 		cors.POST("/common/setting/get-setting", controller.Setting{}.GetSetting)
 		cors.POST("/common/setting/save-config", controller.Setting{}.SaveConfig)
+		cors.POST("/common/setting/delete", controller.Setting{}.Delete)
+		cors.POST("/common/setting/notification-email-test", controller.Home{}.NotificationEmailTest)
+		cors.POST("/common/setting/cache", controller.Home{}.Cache)
+		cors.POST("/common/setting/notification", controller.Home{}.Notification)
 
 		cors.POST("/common/home/info", controller.Home{}.Info)
-		cors.POST("/common/home/check-new-version", controller.Home{}.CheckNewVersion)
+		cors.POST("/common/home/consolelink", controller.Home{}.ConsoleLink)
+
 		cors.POST("/common/home/usage", controller.Home{}.Usage)
-		cors.POST("/common/home/upgrade-script", controller.Home{}.UpgradeScript)
 		cors.POST("/common/home/get-stat-list", controller.Home{}.GetStatList)
-		cors.POST("/common/home/email-test", controller.Home{}.EmailTest)
+		cors.POST("/common/home/prune", controller.Home{}.Prune)
 
 		// 环境管理
 		cors.POST("/common/env/get-list", controller.Env{}.GetList)
@@ -112,92 +122,66 @@ func (provider *Provider) Register(httpServer *http_server.Server) {
 		cors.POST("/common/explorer/delete", controller.Explorer{}.Delete)
 		cors.POST("/common/explorer/chmod", controller.Explorer{}.Chmod)
 		cors.POST("/common/explorer/mkdir", controller.Explorer{}.MkDir)
+		cors.POST("/common/explorer/copy", controller.Explorer{}.Copy)
+
+		cors.POST("/common/panel/usage", controller.Panel{}.Usage)
+		cors.POST("/common/panel/backup", controller.Panel{}.Backup)
+		cors.POST("/common/panel/proxy", controller.Panel{}.Proxy)
+		cors.POST("/common/panel/update", controller.Panel{}.Update)
+		cors.POST("/common/panel/backup-list", controller.Panel{}.BackupList)
+		cors.POST("/common/panel/backup-delete", controller.Panel{}.BackupDelete)
+		cors.POST("/common/panel/backup-download", controller.Panel{}.BackupDownload)
+		cors.POST("/common/panel/backup-restore", controller.Panel{}.BackupRestore)
+		cors.POST("/common/panel/backup-import", controller.Panel{}.BackupImport)
+		cors.POST("/common/panel/check-new-version", controller.Panel{}.CheckNewVersion)
 	})
 
 	httpServer.RegisterRouters(func(engine *gin.Engine) {
-		wsCors := engine.Group("/ws/", common.CorsMiddleware{}.Process)
+		wsCors := engine.Group(function.RouterRootWs(), common.CorsMiddleware{}.Process)
 
 		wsCors.GET("/common/notice", controller.Home{}.WsNotice)
 		wsCors.GET("/common/console/container/:id", controller.Home{}.WsContainerConsole)
-		wsCors.GET("/common/console/host/:name", controller.Home{}.WsHostConsole)
+		wsCors.GET("/common/console/ssh/:name", controller.Home{}.WsSshConsole)
+		wsCors.GET("/common/console/shell", controller.Home{}.WsShellConsole)
 	})
 
-	// 当前如果有连接，则添加一条docker环境数据
-	defaultDockerHost := client.DefaultDockerHost
-	if e := os.Getenv(client.EnvOverrideHost); e != "" {
-		defaultDockerHost = e
-	}
+	_ = facade.GetEvent().Subscribe(event.DockerDaemonEvent, events.Docker{}.Daemon)
+	_ = facade.GetEvent().Subscribe(event.DockerMessageEvent, events.Docker{}.Message)
 
-	defaultDockerEnv, err := logic.DockerEnv{}.GetEnvByName(docker.DefaultClientName)
-	if err != nil {
-		defaultDockerEnv = &docker.Client{
-			Name:    docker.DefaultClientName,
-			Title:   docker.DefaultClientName,
-			Address: defaultDockerHost,
-			Default: true,
-		}
-		logic.DockerEnv{}.UpdateEnv(defaultDockerEnv)
-	}
-
-	options := []docker.Option{
-		docker.WithName(defaultDockerEnv.Name),
-		docker.WithAddress(defaultDockerEnv.Address),
-	}
-	if defaultDockerEnv.EnableTLS {
-		options = append(options, docker.WithTLS(defaultDockerEnv.TlsCa, defaultDockerEnv.TlsCert, defaultDockerEnv.TlsKey))
-	}
-	docker.Sdk, err = docker.NewBuilder(options...)
-	if err != nil {
-		panic(err)
-	}
-
-	// 使用超时上下文，避免 docker 连接地址时间过长卡死程序
-	ctx, _ := context.WithTimeout(context.Background(), docker.ConnectDockerServerTimeout)
-	defaultDockerInfo, err := docker.Sdk.Client.Info(ctx)
-
-	if err == nil {
-		defaultDockerEnv.DockerInfo = &docker.ClientDockerInfo{
-			Name: defaultDockerInfo.Name,
-			ID:   defaultDockerInfo.ID,
-		}
-		logic.DockerEnv{}.UpdateEnv(defaultDockerEnv)
-		// 获取面板信息
-		if info, err := docker.Sdk.Client.ContainerInspect(docker.Sdk.Ctx, facade.GetConfig().GetString("app.name")); err == nil {
-			info.ExecIDs = make([]string, 0)
-			_ = logic.Setting{}.Save(&entity.Setting{
-				GroupName: logic.SettingGroupSetting,
-				Name:      logic.SettingGroupSettingDPanelInfo,
-				Value: &accessor.SettingValueOption{
-					DPanelInfo: &info,
-				},
-			})
-		} else {
-			_ = logic.Setting{}.Delete(logic.SettingGroupSetting, logic.SettingGroupSettingDPanelInfo)
-			slog.Warn("init dpanel info", "name", facade.GetConfig().GetString("app.name"), "error", err)
-		}
-		go logic.EventLogic{}.MonitorLoop()
-	} else {
-		slog.Warn("connect default docker server failed", "name", defaultDockerEnv.Name, "address", defaultDockerEnv.Address, "error", err)
-		defaultDockerEnv.DockerInfo = nil
-		logic.DockerEnv{}.UpdateEnv(defaultDockerEnv)
-	}
-
+	_ = facade.Event.Subscribe(event.PluginDestroyExplorer, events.Plugin{}.DestroyExplorer)
 	// 启动时，初始化计划任务
+	crontab.Client.Cron.Start()
+
 	if cronList, err := dao.Cron.Order(dao.Cron.ID.Desc()).Find(); err == nil {
 		for _, task := range cronList {
 			if task.Setting.Disable {
 				continue
 			}
-			jobIds, err := logic.Cron{}.AddJob(task)
-			if err != nil {
-				task.Setting.NextRunTime = make([]time.Time, 0)
-				task.Setting.JobIds = make([]cron.EntryID, 0)
-				slog.Debug("init crontab task error", "error", err.Error())
-			} else {
-				task.Setting.NextRunTime = crontab.Wrapper.GetNextRunTime(jobIds...)
+			if jobIds, err := (logic.Cron{}).AddCronJob(task); err == nil && jobIds != nil && len(jobIds) > 0 {
 				task.Setting.JobIds = jobIds
+			} else {
+				task.Setting.JobIds = make([]cron.EntryID, 0)
+				if err != nil {
+					slog.Warn("init crontab task error", "error", err.Error())
+				}
 			}
 			_ = dao.Cron.Save(task)
 		}
+	}
+
+	// 配置代理
+	// TODO: 当前启动恢复依赖 Proxy 主开关，后续再补仅持久化 NO_PROXY 的恢复逻辑。
+	if v := (logic.Setting{}).GetDPanelInfo(); v.Proxy != "" {
+		_ = os.Setenv("HTTP_PROXY", v.Proxy)
+		_ = os.Setenv("HTTPS_PROXY", v.Proxy)
+		_ = os.Setenv("NO_PROXY", v.NoProxy)
+		slog.Info("dpanel set proxy", "url", v.Proxy)
+	}
+
+	// 启动全局的监控
+	dockerEnvList := make(map[string]*types2.DockerEnv)
+	logic.Setting{}.GetByKey(logic.SettingGroupSetting, logic.SettingGroupSettingDocker, &dockerEnvList)
+	for _, env := range dockerEnvList {
+		notice.Monitor.Join(env)
 	}
 }

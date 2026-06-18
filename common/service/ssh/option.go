@@ -1,10 +1,15 @@
 package ssh
 
 import (
+	"context"
 	"fmt"
+	"strings"
+	"time"
+
+	"github.com/donknap/dpanel/common/function"
+	"github.com/donknap/dpanel/common/service/storage"
 	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
-	"strings"
 )
 
 func WithAuthBasic(username, password string) Option {
@@ -22,18 +27,26 @@ func WithAuthPem(username string, privateKeyPem string, password string) Option 
 		var signer ssh.Signer
 		var err error
 		self.sshClientConfig.User = username
-		if password != "" {
-			signer, err = ssh.ParsePrivateKeyWithPassphrase([]byte(privateKeyPem), []byte(password))
-		} else {
-			signer, err = ssh.ParsePrivateKey([]byte(privateKeyPem))
-		}
+		signer, err = ssh.ParsePrivateKey([]byte(privateKeyPem))
 		if err != nil {
-			return err
+			if password == "" {
+				return err
+			}
+			signer, err = ssh.ParsePrivateKeyWithPassphrase([]byte(privateKeyPem), []byte(password))
+			if err != nil {
+				return err
+			}
 		}
 		self.sshClientConfig.Auth = []ssh.AuthMethod{
 			ssh.PublicKeys(signer),
 		}
 		return nil
+	}
+}
+
+func WithAuthDefaultPem(username string, rsaKeyContent []byte) Option {
+	return func(self *Client) error {
+		return WithAuthPem(username, string(rsaKeyContent), "")(self)
 	}
 }
 
@@ -52,12 +65,27 @@ func WithAddress(address string, port int) Option {
 }
 
 func WithServerInfo(info *ServerInfo) []Option {
+	if info != nil && info.Password != "" {
+		if w, err := function.RSADecode(info.Password, nil); err == nil {
+			info.Password = w
+		}
+	}
 	option := make([]Option, 0)
 	option = append(option, WithAddress(info.Address, info.Port))
 	if info.AuthType == SshAuthTypePem {
-		option = append(option, WithAuthPem(info.Username, info.PrivateKey, info.Password))
+		pk := info.PrivateKey
+		if v, err := function.RSADecode(info.PrivateKey, nil); err == nil {
+			pk = v
+		}
+		option = append(option, WithAuthPem(info.Username, pk, info.Password))
 	} else if info.AuthType == SshAuthTypeBasic {
 		option = append(option, WithAuthBasic(info.Username, info.Password))
+	} else if info.AuthType == SshAuthTypePemDefault {
+		var rsaKeyContent []byte
+		if v, ok := storage.Cache.Get(storage.CacheKeyRsaKey); ok {
+			rsaKeyContent = v.([]byte)
+		}
+		option = append(option, WithAuthDefaultPem(info.Username, rsaKeyContent))
 	}
 	return option
 }
@@ -65,6 +93,20 @@ func WithServerInfo(info *ServerInfo) []Option {
 func WithSftpClient() Option {
 	return func(self *Client) error {
 		self.SftpConn = &sftp.Client{}
+		return nil
+	}
+}
+
+func WithContext(ctx context.Context) Option {
+	return func(self *Client) error {
+		self.ctx, self.ctxCancel = context.WithCancel(ctx)
+		return nil
+	}
+}
+
+func WithTimeout(s time.Duration) Option {
+	return func(self *Client) error {
+		self.sshClientConfig.Timeout = s
 		return nil
 	}
 }

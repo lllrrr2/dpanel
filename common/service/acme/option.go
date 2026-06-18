@@ -55,7 +55,7 @@ func WithForce() Option {
 
 func WithDnsNginx() Option {
 	return func(self *Acme) error {
-		self.argv = append(self.argv, "--nginx")
+		self.argv = append(self.argv, "--webroot", "/var/www/challenges")
 		return nil
 	}
 }
@@ -99,6 +99,23 @@ func WithConfigHomePath(path string) Option {
 func WithDebug() Option {
 	return func(self *Acme) error {
 		self.argv = append(self.argv, "--debug")
+		return nil
+	}
+}
+
+func WithReloadCommand(file string) Option {
+	return func(self *Acme) error {
+		self.argv = append(self.argv, "--reloadcmd", file)
+		return nil
+	}
+}
+
+func WithEabAccount(kid, hmacKey string) Option {
+	return func(self *Acme) error {
+		if kid == "" || hmacKey == "" {
+			return nil
+		}
+		self.argv = append(self.argv, "--eab-kid", kid, "--eab-hmac-key", hmacKey)
 		return nil
 	}
 }

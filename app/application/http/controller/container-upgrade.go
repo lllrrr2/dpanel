@@ -3,6 +3,11 @@ package controller
 import (
 	"errors"
 	"fmt"
+	"log/slog"
+	"slices"
+	"strings"
+	"time"
+
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/api/types/network"
@@ -13,23 +18,21 @@ import (
 	"github.com/donknap/dpanel/common/function"
 	"github.com/donknap/dpanel/common/service/docker"
 	"github.com/donknap/dpanel/common/service/notice"
+	"github.com/donknap/dpanel/common/types/define"
 	"github.com/donknap/dpanel/common/types/event"
 	"github.com/gin-gonic/gin"
 	v1 "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/we7coreteam/w7-rangine-go/v2/pkg/support/facade"
 	"gorm.io/datatypes"
 	"gorm.io/gen"
-	"log/slog"
-	"slices"
-	"strings"
-	"time"
 )
 
 func (self Container) Upgrade(http *gin.Context) {
 	type ParamsValidate struct {
-		Md5       string `json:"md5" binding:"required"`
-		ImageTag  string `json:"imageTag"`
-		EnableBak bool   `json:"enableBak"`
+		Md5                    string `json:"md5" binding:"required"`
+		ImageTag               string `json:"imageTag"`
+		EnableBak              bool   `json:"enableBak"`
+		EnableResetImageConfig bool   `json:"enableResetImageConfig"` // 重置镜像内的配置
 	}
 	params := ParamsValidate{}
 	if !self.Validate(http, &params) {
@@ -41,15 +44,16 @@ func (self Container) Upgrade(http *gin.Context) {
 		return
 	}
 	if containerInfo.Name == "/"+facade.GetConfig().GetString("APP_NAME") {
-		self.JsonResponseWithError(http, function.ErrorMessage(".containerUpgradeDPanel"), 500)
+		self.JsonResponseWithError(http, function.ErrorMessage(define.ErrorMessageContainerUpgradeDPanel), 500)
 		return
 	}
+	startContainer := containerInfo.State.Running
 
-	bakTime := time.Now().Format(function.YmdHis)
+	bakTime := time.Now().Format(define.DateYmdHis)
 
 	// 更新容器时可以更改镜像 tag
 	if params.ImageTag != "" {
-		containerInfo.Image = params.ImageTag
+		containerInfo.Config.Image = params.ImageTag
 	}
 
 	imageInfo, err := docker.Sdk.Client.ImageInspect(docker.Sdk.Ctx, containerInfo.Config.Image)
@@ -67,6 +71,13 @@ func (self Container) Upgrade(http *gin.Context) {
 		//	"containerId": containerInfo.ID,
 		//})
 		//return
+	}
+	if params.EnableResetImageConfig {
+		containerInfo.Config.Env = imageInfo.Config.Env
+		containerInfo.Config.Labels = imageInfo.Config.Labels
+		containerInfo.Config.WorkingDir = imageInfo.Config.WorkingDir
+		containerInfo.Config.Cmd = imageInfo.Config.Cmd
+		containerInfo.Config.Entrypoint = imageInfo.Config.Entrypoint
 	}
 
 	// 成功的创建一个新的容器后再对旧的进停止或是删除操作
@@ -171,10 +182,13 @@ func (self Container) Upgrade(http *gin.Context) {
 		_ = dao.Site.Save(siteRow)
 	}
 
-	err = docker.Sdk.Client.ContainerStart(docker.Sdk.Ctx, containerInfo.Name, container.StartOptions{})
-	if err != nil {
-		self.JsonResponseWithError(http, err, 500)
-		return
+	// 旧容器如果是停止状态，重建后保持不启动
+	if startContainer {
+		err = docker.Sdk.Client.ContainerStart(docker.Sdk.Ctx, containerInfo.Name, container.StartOptions{})
+		if err != nil {
+			self.JsonResponseWithError(http, err, 500)
+			return
+		}
 	}
 
 	facade.GetEvent().Publish(event.ContainerEditEvent, event.ContainerPayload{
@@ -203,16 +217,16 @@ func (self Container) Ignore(http *gin.Context) {
 	logic2.Setting{}.GetByKey(logic2.SettingGroupSetting, logic2.SettingGroupSettingCheckContainerIgnore, &checkIgnore)
 
 	ignore := fmt.Sprintf("%s@%s", params.Md5, params.ImageId)
-	exists, i := function.IndexArrayWalk(checkIgnore, func(i string) bool {
-		return strings.HasPrefix(string(i), params.Md5+"@")
+	i, ok := function.IndexArrayWalk(checkIgnore, func(i string) bool {
+		return strings.HasPrefix(i, params.Md5+"@")
 	})
 
 	if params.ImageId == "" {
-		if exists {
+		if ok {
 			checkIgnore = slices.Delete(checkIgnore, i, i+1)
 		}
 	} else {
-		if exists {
+		if ok {
 			checkIgnore[i] = ignore
 		} else {
 			checkIgnore = append(checkIgnore, ignore)

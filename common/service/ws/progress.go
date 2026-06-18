@@ -3,13 +3,19 @@ package ws
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strings"
+
 	"github.com/donknap/dpanel/app/common/logic"
 	"github.com/donknap/dpanel/common/function"
 	"github.com/gin-gonic/gin"
-	"time"
 )
 
 type ProgressWrite func(p []byte) ([]byte, error)
+
+func PushEvent(messageType string, data interface{}) {
+	BroadcastMessage <- NewRespMessage("", messageType, data)
+}
 
 func NewProgressPip(messageType string) *ProgressPip {
 	ctx, cancelFunc := context.WithCancel(context.Background())
@@ -25,10 +31,14 @@ func NewProgressPip(messageType string) *ProgressPip {
 		}
 	}
 	collect.progressPip.Store(messageType, process)
+	go func() {
+		<-process.ctx.Done()
+		collect.progressPip.Delete(process.messageType)
+	}()
 	return process
 }
 
-// 利用 fd 新建一个公共推送管道，多个 fd 共用一个，直到所有 fd 都退出
+// NewFdProgressPip 利用 fd 新建一个公共推送管道，多个 fd 共用一个，直到所有 fd 都退出
 func NewFdProgressPip(http *gin.Context, messageType string) (*ProgressPip, error) {
 	fd := ""
 	if data, exists := http.Get("userInfo"); exists {
@@ -78,16 +88,11 @@ func (self *ProgressPip) Write(p []byte) (n int, err error) {
 }
 
 func (self *ProgressPip) BroadcastMessage(data interface{}) {
-	BroadcastMessage <- &RespMessage{
-		Type:   self.messageType,
-		Data:   data,
-		RespAt: time.Now(),
-	}
+	BroadcastMessage <- NewRespMessage("", self.messageType, data)
 }
 
 func (self *ProgressPip) Close() {
 	self.cancel()
-	collect.progressPip.Delete(self.messageType)
 }
 
 func (self *ProgressPip) CloseFd(fd string) {
@@ -117,4 +122,8 @@ func (self *ProgressPip) Context() context.Context {
 func (self *ProgressPip) KeepAlive() *ProgressPip {
 	self.IsKeepAlive = true
 	return self
+}
+
+func (self *ProgressPip) String() string {
+	return fmt.Sprintf("messageType: %s, fd: %s", self.messageType, strings.Join(self.fd, ","))
 }

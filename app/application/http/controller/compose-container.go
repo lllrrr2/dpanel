@@ -1,37 +1,43 @@
 package controller
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/pkg/stdcopy"
-	"github.com/donknap/dpanel/app/application/logic"
-	"github.com/donknap/dpanel/common/accessor"
-	"github.com/donknap/dpanel/common/dao"
-	"github.com/donknap/dpanel/common/function"
-	"github.com/donknap/dpanel/common/service/docker"
-	"github.com/donknap/dpanel/common/service/exec"
-	"github.com/donknap/dpanel/common/service/notice"
-	"github.com/donknap/dpanel/common/service/ws"
-	"github.com/gin-gonic/gin"
 	"io"
 	"log/slog"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
-	"time"
+
+	"github.com/docker/docker/api/types/container"
+	"github.com/donknap/dpanel/app/application/logic"
+	"github.com/donknap/dpanel/common/accessor"
+	"github.com/donknap/dpanel/common/dao"
+	"github.com/donknap/dpanel/common/entity"
+	"github.com/donknap/dpanel/common/function"
+	"github.com/donknap/dpanel/common/service/docker"
+	"github.com/donknap/dpanel/common/service/docker/imports"
+	"github.com/donknap/dpanel/common/service/docker/types"
+	"github.com/donknap/dpanel/common/service/notice"
+	"github.com/donknap/dpanel/common/service/plugin"
+	"github.com/donknap/dpanel/common/service/storage"
+	"github.com/donknap/dpanel/common/service/ws"
+	"github.com/donknap/dpanel/common/types/define"
+	"github.com/donknap/dpanel/common/types/event"
+	"github.com/gin-gonic/gin"
+	"github.com/we7coreteam/w7-rangine-go/v2/pkg/support/facade"
 )
 
 func (self Compose) ContainerDeploy(http *gin.Context) {
 	type ParamsValidate struct {
-		Id                string           `json:"id" binding:"required"`
-		Environment       []docker.EnvItem `json:"environment"`
-		DeployServiceName []string         `json:"deployServiceName"`
-		CreatePath        bool             `json:"createPath"`
-		RemoveOrphans     bool             `json:"removeOrphans"`
-		PullImage         bool             `json:"pullImage"`
-		AutoRemove        bool             `json:"autoRemove"`
+		Id                string          `json:"id" binding:"required"`
+		Environment       []types.EnvItem `json:"environment"`
+		DeployServiceName []string        `json:"deployServiceName"`
+		CreatePath        bool            `json:"createPath"`
+		RemoveOrphans     bool            `json:"removeOrphans"`
+		PullImage         bool            `json:"pullImage"`
+		Build             bool            `json:"build"`
 	}
 	params := ParamsValidate{}
 	if !self.Validate(http, &params) {
@@ -41,30 +47,46 @@ func (self Compose) ContainerDeploy(http *gin.Context) {
 
 	composeRow, _ := logic.Compose{}.Get(params.Id)
 	if composeRow == nil {
-		self.JsonResponseWithError(http, function.ErrorMessage(".commonDataNotFoundOrDeleted"), 500)
+		self.JsonResponseWithError(http, function.ErrorMessage(define.ErrorMessageCommonDataNotFoundOrDeleted), 500)
 		return
-	}
-	if !function.IsEmptyArray(params.Environment) {
-		composeRow.Setting.Environment = params.Environment
-	}
-	if !function.IsEmptyArray(params.DeployServiceName) {
-		composeRow.Setting.DeployServiceName = params.DeployServiceName
-	} else if !function.IsEmptyArray(composeRow.Setting.DeployServiceName) {
-		params.DeployServiceName = composeRow.Setting.DeployServiceName
-	}
-	composeRow.Setting.UpdatedAt = time.Now().Format(function.ShowYmdHis)
-	if composeRow.Setting.Status == accessor.ComposeStatusWaiting {
-		composeRow.Setting.CreatedAt = time.Now().Format(function.ShowYmdHis)
 	}
 
-	tasker, err := logic.Compose{}.GetTasker(composeRow)
+	if !function.IsEmptyArray(params.DeployServiceName) {
+		composeRow.Setting.DeployServiceName = params.DeployServiceName
+	}
+	tasker, warning, err := logic.Compose{}.GetTasker(&entity.Compose{
+		Name: composeRow.Name,
+		Setting: &accessor.ComposeSettingOption{
+			Type:          composeRow.Setting.Type,
+			Uri:           composeRow.Setting.Uri,
+			RemoteUrl:     composeRow.Setting.RemoteUrl,
+			Environment:   params.Environment,
+			DockerEnvName: composeRow.Setting.DockerEnvName,
+			RunName:       composeRow.Setting.RunName,
+		},
+	})
 	if err != nil {
-		self.JsonResponseWithError(http, err, 500)
+		self.JsonResponseWithError(http, function.ErrorMessage(define.ErrorMessageComposeParseYamlIncorrect, "error", errors.Join(warning, err).Error()), 500)
 		return
 	}
+
+	// 添加禁用服务，只有部署的时候需要，避免在获取详情时拿不到全部服务
+	if !function.IsEmptyArray(composeRow.Setting.DeployServiceName) {
+		services, err := tasker.Project.GetServices()
+		if err != nil {
+			self.JsonResponseWithError(http, err, 500)
+			return
+		}
+		for _, item := range services {
+			if !function.InArray(composeRow.Setting.DeployServiceName, item.Name) {
+				tasker.Project = tasker.Project.WithServicesDisabled(item.Name)
+			}
+		}
+	}
+
 	// 尝试创建 compose 挂载的目录，如果运行在容器内创建也无效
 	if params.CreatePath {
-		for _, service := range tasker.Project().Services {
+		for _, service := range tasker.Project.Services {
 			for _, volume := range service.Volumes {
 				if filepath.IsAbs(volume.Source) {
 					if _, err = os.Stat(volume.Source); err != nil {
@@ -76,23 +98,71 @@ func (self Compose) ContainerDeploy(http *gin.Context) {
 	}
 	_ = notice.Message{}.Info(".composeDeploy", "name", composeRow.Name)
 
-	response, err := tasker.Deploy(params.DeployServiceName, params.RemoveOrphans, params.PullImage)
+	// 如果是远程连接，尝试将本地的 compose 目录数据同步到端
+	if function.InArray([]string{
+		define.DockerRemoteTypeSSH,
+		define.DockerRemoteTypeTcp,
+	}, docker.Sdk.DockerEnv.RemoteType) {
+		_, err := logic.Explorer{}.Afs(docker.Sdk, logic.AfsCreateOption{
+			MountPoint: plugin.ExplorerName,
+			Init:       true,
+		})
+		if err != nil {
+			self.JsonResponseWithError(http, err, 500)
+			return
+		}
+		rel, err := filepath.Rel(storage.Local{}.GetStorageLocalPath(), tasker.Project.WorkingDir)
+		if err != nil {
+			self.JsonResponseWithError(http, err, 500)
+			return
+		}
+		importRootPath := path.Join("/dpanel", filepath.ToSlash(rel))
+		slog.Debug("compose container sync path", "path", importRootPath)
+
+		importFileList, err := imports.NewFileImport(importRootPath, imports.WithImportPath(tasker.Project.WorkingDir))
+		if err != nil {
+			self.JsonResponseWithError(http, err, 500)
+			return
+		}
+		defer func() {
+			importFileList.Close()
+		}()
+		err = docker.Sdk.ContainerImport(docker.Sdk.Ctx, plugin.ExplorerName, "/", importFileList.Reader())
+		if err != nil {
+			self.JsonResponseWithError(http, err, 500)
+			return
+		}
+	}
+
+	progress := ws.NewProgressPip(fmt.Sprintf(ws.MessageTypeCompose, params.Id))
+	defer progress.Close()
+
+	var response io.ReadCloser
+	if params.Build {
+		response, err = tasker.Build()
+	} else {
+		response, err = tasker.Deploy(params.RemoveOrphans, params.PullImage)
+	}
 	if err != nil {
 		self.JsonResponseWithError(http, err, 500)
 		return
 	}
 
-	wsBuffer := ws.NewProgressPip(fmt.Sprintf(ws.MessageTypeCompose, params.Id))
-	defer wsBuffer.Close()
+	go func() {
+		<-progress.Done()
+		_ = response.Close()
+	}()
 
-	lastMessage := ""
-	wsBuffer.OnWrite = func(p string) error {
-		lastMessage = p
-		wsBuffer.BroadcastMessage(p)
+	progress.OnWrite = func(p string) error {
+		progress.BroadcastMessage(p)
 		return nil
 	}
 
-	_, err = io.Copy(wsBuffer, response)
+	_, err = io.Copy(progress, response)
+	if err != nil {
+		// copy 出错的只记录日志，不提示用户
+		slog.Warn("compose container deploy copy", "error", err)
+	}
 	if err != nil {
 		if function.ErrorHasKeyword(err, "denied: You may not login") {
 			_ = notice.Message{}.Error(".imagePullInvalidAuth")
@@ -109,72 +179,64 @@ func (self Compose) ContainerDeploy(http *gin.Context) {
 		_ = dao.Compose.Save(composeRow)
 	}
 
-	if err != nil {
-		self.JsonResponseWithError(http, err, 500)
-		return
-	}
-	// 再次验证 任务是否部署成功，从而判断要不要输出错误信息
-	tasker, err = logic.Compose{}.GetTasker(composeRow)
-	if err != nil {
-		self.JsonResponseWithError(http, err, 500)
+	// 查看当前任务下的容器 hash 值是否部署成功
+	runCompose := logic.Compose{}.LsItem(composeRow.Name)
+	if runCompose == nil || len(runCompose.ContainerList) != len(tasker.Project.Services) {
+		self.JsonResponseWithError(http, function.ErrorMessage(define.ErrorMessageComposeDeployIncorrect), 500)
 		return
 	}
 
-	if params.AutoRemove {
-		response1, err := tasker.Destroy(false, true)
-		if err != nil {
-			self.JsonResponseWithError(http, err, 500)
+	for _, item := range runCompose.ContainerList {
+		if item.Container.State != container.StateRunning {
+			self.JsonResponseWithError(http, function.ErrorMessage(define.ErrorMessageComposeDeployIncorrect), 500)
 			return
 		}
-		_, err = io.Copy(wsBuffer, response1)
-		self.JsonSuccessResponse(http)
-		return
 	}
 
-	taskContainerList := tasker.Ps()
-	if function.IsEmptyArray(taskContainerList) {
-		self.JsonResponseWithError(http, errors.New(lastMessage), 500)
-		return
-	}
-
-	for _, item := range taskContainerList {
-		if _, err := docker.Sdk.Client.ContainerInspect(docker.Sdk.Ctx, item.Name); err != nil {
-			self.JsonResponseWithError(http, errors.New(lastMessage), 500)
-			return
+	// 如果当前容器配置过转发，则加入 dpanel-local 网络
+	for _, item := range runCompose.ContainerList {
+		if row, err := dao.SiteDomain.Where(dao.SiteDomain.ContainerID.In(item.Container.Names...)).First(); err == nil {
+			_ = docker.Sdk.NetworkConnect(docker.Sdk.Ctx, types.NetworkItem{
+				Name: define.DPanelProxyNetworkName,
+			}, row.ContainerID)
 		}
 	}
 
 	// 这里需要单独适配一下 php 环境的相关扩展安装
 	// 目前只有 php 需要这样处理，暂时先直接进行判断
-	if strings.HasPrefix(composeRow.Setting.Store, accessor.StoreTypeOnePanel) && strings.HasSuffix(composeRow.Setting.Store, "@php") {
-		out, err := docker.Sdk.ContainerExec(docker.Sdk.Ctx, taskContainerList[0].Name, container.ExecOptions{
-			Privileged:   true,
-			Tty:          false,
-			AttachStdin:  false,
-			AttachStdout: true,
-			AttachStderr: false,
-			Cmd: []string{
-				"install-ext",
-				strings.Join(function.PluckArrayWalk(params.Environment, func(item docker.EnvItem) (string, bool) {
-					if item.Name == "PHP_EXTENSIONS" {
-						return item.Value, true
-					} else {
-						return "", false
-					}
-				}), " "),
-			},
-		})
-		if err != nil {
-			self.JsonResponseWithError(http, err, 500)
-			return
-		}
-		defer func() {
-			out.Close()
-		}()
-		_, err = io.Copy(wsBuffer, out.Reader)
-		if err != nil {
-			self.JsonResponseWithError(http, err, 500)
-			return
+	if strings.HasPrefix(composeRow.Setting.Store, define.StoreTypeOnePanel) && strings.HasSuffix(composeRow.Setting.Store, "@php") {
+		_ = docker.Sdk.NetworkConnect(docker.Sdk.Ctx, types.NetworkItem{
+			Name: define.DPanelProxyNetworkName,
+		}, runCompose.ContainerList[0].Container.Names[0])
+
+		_, _ = progress.Write([]byte("Start install PHP_EXTENSIONS \n"))
+		if phpExt, _, ok := function.PluckArrayItemWalk(params.Environment, func(item types.EnvItem) bool {
+			return item.Name == "PHP_EXTENSIONS"
+		}); ok {
+			_, _ = progress.Write([]byte("Install PHP_EXTENSIONS " + phpExt.String() + "\n"))
+			out, err := docker.Sdk.ContainerExec(progress.Context(), runCompose.ContainerList[0].Container.ID, container.ExecOptions{
+				Privileged:   true,
+				Tty:          false,
+				AttachStdin:  false,
+				AttachStdout: true,
+				AttachStderr: false,
+				Cmd: []string{
+					"install-ext",
+					phpExt.Value,
+				},
+			})
+			if err != nil {
+				self.JsonResponseWithError(http, err, 500)
+				return
+			}
+			defer func() {
+				out.Close()
+			}()
+			_, err = io.Copy(progress, out.Reader)
+			if err != nil {
+				self.JsonResponseWithError(http, function.ErrorMessage(define.ErrorMessageComposeDeployIncorrect), 500)
+				return
+			}
 		}
 	}
 
@@ -184,11 +246,12 @@ func (self Compose) ContainerDeploy(http *gin.Context) {
 
 func (self Compose) ContainerDestroy(http *gin.Context) {
 	type ParamsValidate struct {
-		Id           string `json:"id" binding:"required"`
-		DeleteImage  bool   `json:"deleteImage"`
-		DeleteVolume bool   `json:"deleteVolume"`
-		DeleteData   bool   `json:"deleteData"`
-		DeletePath   bool   `json:"deletePath"`
+		Id                 string   `json:"id" binding:"required"`
+		DeleteImage        bool     `json:"deleteImage"`
+		DeleteVolume       bool     `json:"deleteVolume"`
+		DeleteData         bool     `json:"deleteData"`
+		DeletePath         bool     `json:"deletePath"`
+		DestroyServiceName []string `json:"destroyServiceName"`
 	}
 
 	params := ParamsValidate{}
@@ -197,50 +260,70 @@ func (self Compose) ContainerDestroy(http *gin.Context) {
 	}
 	composeRow, _ := logic.Compose{}.Get(params.Id)
 	if composeRow == nil {
-		self.JsonResponseWithError(http, function.ErrorMessage(".commonDataNotFoundOrDeleted"), 500)
+		self.JsonResponseWithError(http, function.ErrorMessage(define.ErrorMessageCommonDataNotFoundOrDeleted), 500)
 		return
 	}
-	tasker, err := logic.Compose{}.GetTasker(composeRow)
-	if err != nil {
-		self.JsonResponseWithError(http, err, 500)
-		return
-	}
-	response, err := tasker.Destroy(params.DeleteImage, params.DeleteVolume)
-	if err != nil {
-		self.JsonResponseWithError(http, err, 500)
-		return
-	}
+	runCompose := logic.Compose{}.LsItem(composeRow.Name)
+	if runCompose != nil && len(runCompose.ContainerList) != 0 {
+		tasker, _, err := logic.Compose{}.GetTasker(composeRow)
+		if err != nil {
+			self.JsonResponseWithError(http, err, 500)
+			return
+		}
 
-	wsBuffer := ws.NewProgressPip(fmt.Sprintf(ws.MessageTypeCompose, params.Id))
-	defer wsBuffer.Close()
+		if !function.IsEmptyArray(params.DestroyServiceName) {
+			for _, item := range params.DestroyServiceName {
+				tasker.Project = tasker.Project.WithServicesDisabled(item)
+			}
+		}
 
-	_, err = io.Copy(wsBuffer, response)
-	if err != nil {
-		slog.Error("compose", "destroy copy error", err)
+		progress := ws.NewProgressPip(fmt.Sprintf(ws.MessageTypeCompose, params.Id))
+		defer progress.Close()
+
+		response, err := tasker.Destroy(params.DeleteImage, params.DeleteVolume)
+		if err != nil {
+			self.JsonResponseWithError(http, err, 500)
+			return
+		}
+		go func() {
+			<-progress.Done()
+			_ = response.Close()
+		}()
+		_, err = io.Copy(progress, response)
+		if err != nil {
+			self.JsonResponseWithError(http, err, 500)
+			return
+		}
 	}
 
 	if params.DeleteData {
-		_, err = dao.Compose.Where(dao.Compose.ID.Eq(composeRow.ID)).Delete()
+		_, err := dao.Compose.Where(dao.Compose.ID.Eq(composeRow.ID)).Delete()
 		if err != nil {
-			slog.Debug("compose", "destroy", err)
+			slog.Info("compose", "destroy", err)
+		} else {
+			facade.GetEvent().Publish(event.ComposeDeleteEvent, event.ComposePayload{
+				Compose: composeRow,
+				Ctx:     http,
+			})
 		}
 	} else {
 		composeRow.Setting.DeployServiceName = make([]string, 0)
 		composeRow.Setting.Status = ""
-		composeRow.Setting.CreatedAt = ""
-		composeRow.Setting.UpdatedAt = ""
 		_ = dao.Compose.Save(composeRow)
 	}
 
 	if params.DeletePath {
 		if !params.DeleteData {
-			self.JsonResponseWithError(http, function.ErrorMessage(".composeDeleteFileMustDeleteTask"), 500)
+			self.JsonResponseWithError(http, function.ErrorMessage(define.ErrorMessageComposeDeleteFileMustDeleteTask), 500)
 			return
 		}
-		err = os.Remove(filepath.Join(filepath.Dir(composeRow.Setting.GetUriFilePath()), logic.ComposeProjectEnvFileName))
-		err = os.RemoveAll(filepath.Dir(composeRow.Setting.GetUriFilePath()))
+		targetPath := storage.Local{}.GetComposeProjectPath(composeRow.Setting.DockerEnvName, composeRow.Name)
+		if !function.IsEmptyArray(composeRow.Setting.Uri) {
+			targetPath = filepath.Dir(composeRow.Setting.GetUriFilePath())
+		}
+		err := os.RemoveAll(targetPath)
 		if err != nil {
-			slog.Debug("compose", "destroy", err)
+			slog.Info("compose", "destroy", err)
 		}
 	}
 	_ = notice.Message{}.Info(".composeDestroy", "name", composeRow.Name)
@@ -260,38 +343,32 @@ func (self Compose) ContainerCtrl(http *gin.Context) {
 	}
 	composeRow, _ := logic.Compose{}.Get(params.Id)
 	if composeRow == nil {
-		self.JsonResponseWithError(http, function.ErrorMessage(".commonDataNotFoundOrDeleted"), 500)
+		self.JsonResponseWithError(http, function.ErrorMessage(define.ErrorMessageCommonDataNotFoundOrDeleted), 500)
 		return
 	}
-	tasker, err := logic.Compose{}.GetTasker(composeRow)
+	tasker, _, err := logic.Compose{}.GetTasker(composeRow)
 	if err != nil {
 		self.JsonResponseWithError(http, err, 500)
 		return
 	}
+
+	progress := ws.NewProgressPip(fmt.Sprintf(ws.MessageTypeCompose, params.Id))
+	defer progress.Close()
 
 	response, err := tasker.Ctrl(params.Op)
 	if err != nil {
 		self.JsonResponseWithError(http, err, 500)
 		return
 	}
-	wsBuffer := ws.NewProgressPip(fmt.Sprintf(ws.MessageTypeCompose, params.Id))
-	defer wsBuffer.Close()
-
-	_, err = io.Copy(wsBuffer, response)
+	go func() {
+		<-progress.Done()
+		_ = response.Close()
+	}()
+	_, err = io.Copy(progress, response)
 	if err != nil {
-		slog.Error("compose", "destroy copy error", err)
+		slog.Warn("compose destroy copy", "error", err)
 	}
 
-	self.JsonSuccessResponse(http)
-	return
-}
-
-func (self Compose) ContainerProcessKill(http *gin.Context) {
-	err := exec.Kill()
-	if err != nil {
-		self.JsonResponseWithError(http, err, 500)
-		return
-	}
 	self.JsonSuccessResponse(http)
 	return
 }
@@ -310,10 +387,10 @@ func (self Compose) ContainerLog(http *gin.Context) {
 
 	composeRow, _ := logic.Compose{}.Get(params.Id)
 	if composeRow == nil {
-		self.JsonResponseWithError(http, notice.Message{}.New(".commonDataNotFoundOrDeleted"), 500)
+		self.JsonResponseWithError(http, function.ErrorMessage(define.ErrorMessageCommonDataNotFoundOrDeleted), 500)
 		return
 	}
-	tasker, err := logic.Compose{}.GetTasker(composeRow)
+	tasker, _, err := logic.Compose{}.GetTasker(composeRow)
 	if err != nil {
 		self.JsonResponseWithError(http, err, 500)
 		return
@@ -346,20 +423,13 @@ func (self Compose) ContainerLog(http *gin.Context) {
 		case <-wsBuffer.Done():
 			err = response.Close()
 			if err != nil {
-				slog.Debug("compose", "run log  response close", fmt.Sprintf(ws.MessageTypeComposeLog, params.Id), "error", err)
+				slog.Warn("compose run log ws buffer close", "id", fmt.Sprintf(ws.MessageTypeComposeLog, params.Id), "error", err)
 			}
 		}
 	}()
 
 	wsBuffer.OnWrite = func(p string) error {
-		newReader := bytes.NewReader([]byte(p))
-		stdout := new(bytes.Buffer)
-		_, err = stdcopy.StdCopy(stdout, stdout, newReader)
-		if err != nil {
-			wsBuffer.BroadcastMessage(p)
-		} else {
-			wsBuffer.BroadcastMessage(stdout.String())
-		}
+		wsBuffer.BroadcastMessage(p)
 		return nil
 	}
 	_, err = io.Copy(wsBuffer, response)

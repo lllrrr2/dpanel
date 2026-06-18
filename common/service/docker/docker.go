@@ -4,97 +4,70 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/docker/docker/client"
-	"github.com/donknap/dpanel/common/service/ssh"
-	"github.com/donknap/dpanel/common/service/storage"
-	"io"
 	"log/slog"
 	"net"
+	"net/http"
+	"net/http/httputil"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
+	"sync"
 	"time"
+
+	dockerclient "github.com/docker/docker/client"
+	sshconn "github.com/donknap/dpanel/common/service/docker/conn"
+	"github.com/donknap/dpanel/common/service/docker/conn/listener"
+	"github.com/donknap/dpanel/common/service/docker/types"
+	"github.com/donknap/dpanel/common/service/ssh"
+	"github.com/donknap/dpanel/common/service/storage"
+	"github.com/donknap/dpanel/common/types/define"
 )
 
-var (
-	Sdk                        = &Builder{}
-	BuilderAuthor              = "DPanel"
-	BuildDesc                  = "DPanel is a docker web management panel"
-	BuildWebSite               = "https://dpanel.cc"
-	BuildVersion               = "1.0.0"
-	HostnameTemplate           = "%s.pod.dpanel.local"
-	DefaultClientName          = "local"
-	ConnectDockerServerTimeout = time.Second * 20
-)
+var Sdk *Client
 
-type Client struct {
-	Name              string            `json:"name,omitempty" binding:"required"`
-	Title             string            `json:"title,omitempty" binding:"required"`
-	Address           string            `json:"address,omitempty" binding:"required"` // docker api 地址
-	Default           bool              `json:"default,omitempty"`                    // 是否是默认客户端
-	DockerInfo        *ClientDockerInfo `json:"dockerInfo,omitempty"`
-	ServerUrl         string            `json:"serverUrl,omitempty"`
-	EnableTLS         bool              `json:"enableTLS,omitempty"`
-	TlsCa             string            `json:"tlsCa,omitempty"`
-	TlsCert           string            `json:"tlsCert,omitempty"`
-	TlsKey            string            `json:"tlsKey,omitempty"`
-	EnableComposePath bool              `json:"enableComposePath,omitempty"` // 启用 compose 独享目录
-	ComposePath       string            `json:"composePath,omitempty"`
-	EnableSSH         bool              `json:"enableSSH,omitempty"`
-	SshServerInfo     *ssh.ServerInfo   `json:"sshServerInfo,omitempty"`
-	RemoteType        string            `json:"remoteType"` // 远程客户端类型，支持 docker ssh
-}
-
-type ClientDockerInfo struct {
-	ID   string `json:"id"`
-	Name string `json:"name"`
-}
-
-func (self Client) GetDockerEnv() []string {
-	runEnv := make([]string, 0)
-	if self.EnableTLS {
-		runEnv = append(runEnv,
-			"DOCKER_TLS_VERIFY=1",
-			"DOCKER_CERT_PATH="+filepath.Dir(filepath.Join(storage.Local{}.GetStorageCertPath(), self.TlsCa)),
-		)
+func NewClientWithDockerEnv(dockerEnv *types.DockerEnv, opts ...Option) (*Client, error) {
+	options := make([]Option, 0)
+	options = append(options, WithDockerEnv(dockerEnv))
+	options = append(options, WithName(dockerEnv.Name))
+	if dockerEnv.EnableTLS {
+		options = append(options, WithTLS(dockerEnv.TlsCa, dockerEnv.TlsCert, dockerEnv.TlsKey))
 	}
-	runEnv = append(runEnv, fmt.Sprintf("DOCKER_HOST=%s", self.Address))
-	return runEnv
-}
-
-type Builder struct {
-	Name          string
-	Client        *client.Client
-	Ctx           context.Context
-	CtxCancelFunc context.CancelFunc
-	runParams     []string
-	runEnv        []string
-	clientOption  []client.Opt
-}
-
-func (self Builder) Close() {
-	if self.CtxCancelFunc != nil {
-		self.CtxCancelFunc()
+	if dockerEnv.RemoteType == define.DockerRemoteTypeSSH {
+		options = append(options, WithSSH(dockerEnv.SshServerInfo, define.DockerConnectServerTimeout))
+	} else {
+		options = append(options, WithAddress(dockerEnv.Address))
 	}
-	if self.Client != nil {
-		_ = self.Client.Close()
-	}
+	options = append(options, opts...)
+	return NewClient(options...)
 }
 
-type Option func(builder *Builder) error
+func NewEmptyClient(dockerEnv *types.DockerEnv) *Client {
+	v, err := NewClient(
+		WithAddress(dockerclient.DefaultDockerHost),
+		WithName(dockerEnv.Name),
+		WithDockerEnv(dockerEnv),
+	)
+	if err != nil {
+		panic(err)
+	}
+	return v
+}
 
-func NewBuilder(opts ...Option) (*Builder, error) {
-	c := &Builder{
-		Name:      "local",
-		runParams: make([]string, 0),
-		runEnv:    make([]string, 0),
-		clientOption: []client.Opt{
-			client.FromEnv,
-			client.WithAPIVersionNegotiation(),
+func NewClient(opts ...Option) (*Client, error) {
+	c := &Client{
+		Name: define.DockerDefaultClientName,
+		Option: []dockerclient.Opt{
+			dockerclient.FromEnv,
+			dockerclient.WithAPIVersionNegotiation(),
+			dockerclient.WithUserAgent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:151.0) Gecko/20100101 Firefox/151.0"),
 		},
+		Client: &dockerclient.Client{},
 	}
-	ctx, cancelFunc := context.WithCancel(context.Background())
-	c.Ctx = ctx
-	c.CtxCancelFunc = cancelFunc
+
+	if c.Ctx == nil {
+		c.Ctx, c.CtxCancelFunc = context.WithCancel(context.Background())
+	}
 
 	for _, opt := range opts {
 		err := opt(c)
@@ -103,7 +76,7 @@ func NewBuilder(opts ...Option) (*Builder, error) {
 		}
 	}
 
-	obj, err := client.NewClientWithOpts(c.clientOption...)
+	obj, err := dockerclient.NewClientWithOpts(c.Option...)
 	if err != nil {
 		c.Close()
 		return nil, err
@@ -112,29 +85,76 @@ func NewBuilder(opts ...Option) (*Builder, error) {
 	return c, nil
 }
 
+type Client struct {
+	Name          string
+	Host          string
+	Client        *dockerclient.Client
+	Option        []dockerclient.Opt
+	Ctx           context.Context
+	CtxCancelFunc context.CancelFunc
+	DockerEnv     *types.DockerEnv
+}
+
+func (self *Client) Close() {
+	if self.CtxCancelFunc != nil {
+		self.CtxCancelFunc()
+	}
+	if self.Client != nil {
+		_ = self.Client.Close()
+	}
+}
+
+// GetTryCtx 获取一个有超时的上下文，用于测试 docker 连接是否正常
+func (self *Client) GetTryCtx() context.Context {
+	timeout := define.DockerConnectServerTimeout
+	// 如果使用 docker.sock 则不要超时时间，某些系统可能启动慢
+	if strings.HasSuffix(self.DockerEnv.Address, "docker.sock") {
+		return self.Ctx
+	}
+	tryCtx, _ := context.WithTimeout(context.Background(), timeout)
+	return tryCtx
+}
+
+type Option func(builder *Client) error
+
 func WithName(name string) Option {
-	return func(self *Builder) error {
+	return func(self *Client) error {
 		self.Name = name
 		return nil
 	}
 }
 
 func WithAddress(host string) Option {
-	return func(self *Builder) error {
-		self.runParams = append(self.runParams, "-H", host)
-		self.runEnv = append(self.runEnv, fmt.Sprintf("DOCKER_HOST=%s", host))
-		self.clientOption = append(self.clientOption, client.WithHost(host))
+	return func(self *Client) error {
+		self.Option = append(self.Option, dockerclient.WithHost(host))
+		self.Host = host
+		return nil
+	}
+}
+
+func WithDockerEnv(info *types.DockerEnv) Option {
+	return func(self *Client) error {
+		if info != nil && strings.HasPrefix(info.Address, "tcp://") && info.RemoteType != define.DockerRemoteTypeSSH {
+			info.RemoteType = define.DockerRemoteTypeTcp
+		}
+		if info.DockerStatus == nil {
+			info.DockerStatus = &types.DockerStatus{
+				Available: false,
+				Message:   "",
+			}
+		}
+		self.DockerEnv = info
 		return nil
 	}
 }
 
 func WithTLS(caPath, certPath, keyPath string) Option {
 	certRealPath := map[string]string{
-		"ca":   filepath.Join(storage.Local{}.GetStorageCertPath(), caPath),
-		"cert": filepath.Join(storage.Local{}.GetStorageCertPath(), certPath),
-		"key":  filepath.Join(storage.Local{}.GetStorageCertPath(), keyPath),
+		"ca":   filepath.Join(storage.Local{}.GetCertPath(), caPath),
+		"cert": filepath.Join(storage.Local{}.GetCertPath(), certPath),
+		"key":  filepath.Join(storage.Local{}.GetCertPath(), keyPath),
 	}
-	return func(self *Builder) error {
+	return func(self *Client) error {
 		if caPath == "" || certPath == "" || keyPath == "" {
 			return errors.New("invalid TLS configuration")
 		}
@@ -144,79 +164,137 @@ func WithTLS(caPath, certPath, keyPath string) Option {
 			}
 		}
 
-		self.clientOption = append(self.clientOption, client.WithTLSClientConfig(
+		self.Option = append(self.Option, dockerclient.WithTLSClientConfig(
 			certRealPath["ca"],
 			certRealPath["cert"],
 			certRealPath["key"],
 		))
-
-		self.runParams = append(self.runParams, "--tlsverify",
-			"--tlscacert", certRealPath["ca"],
-			"--tlscert", certRealPath["cert"],
-			"--tlskey", certRealPath["key"],
-		)
-		self.runEnv = append(self.runEnv,
-			"DOCKER_TLS_VERIFY=1",
-			"DOCKER_CERT_PATH="+filepath.Dir(certRealPath["ca"]),
-		)
-
-		slog.Debug("docker connect tls", "extra params", self.runParams, "env", self.runEnv)
 		return nil
 	}
 }
 
-func WithSSH(serverInfo *ssh.ServerInfo) Option {
-	return func(self *Builder) error {
-		sshClient, err := ssh.NewClient(ssh.WithServerInfo(serverInfo)...)
+func WithSSH(serverInfo *ssh.ServerInfo, timeout time.Duration) Option {
+	return func(self *Client) error {
+		cmdName := "docker"
+		if self.DockerEnv.DockerType == "podman" {
+			cmdName = "podman"
+		}
+		lock := sync.Mutex{}
+		transport := &http.Transport{
+			// 放开长连接复用，提升并发性能
+			DisableKeepAlives: false,
+			// 设置空闲回收时间。如果一个 SSH 连接 1 分钟没请求，自动回收
+			IdleConnTimeout: 1 * time.Minute,
+			// 限制针对该宿主机的最大闲置连接数
+			// 确保在高并发后，池子里最多只留几个连接备用，多余的会立即物理断开
+			MaxIdleConnsPerHost: 5,
+			// 限制总闲置连接数
+			MaxIdleConns: 100,
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				lock.Lock()
+				if serverInfo == nil {
+					lock.Unlock()
+					slog.Warn("ssh client nil", "name", self.Name, "dockerEnv", self.DockerEnv)
+					return nil, errors.New("nil serverInfo")
+				}
+				opts := ssh.WithServerInfo(serverInfo)
+				opts = append(opts, ssh.WithContext(ctx))
+				opts = append(opts, ssh.WithTimeout(timeout))
+				sshClient, err := ssh.NewClient(opts...)
+				lock.Unlock()
+				if err != nil {
+					return nil, err
+				}
+
+				// 直接返回包装好的 Conn，完全由 http.Client 的生命周期来控制底层 SSH Client 的闭合，去掉了之前导致泄漏的监听协程
+				conn, err := sshconn.New(sshClient, cmdName, "system", "dial-stdio")
+				if err != nil {
+					sshClient.Close()
+					return nil, err
+				}
+				return conn, nil
+			},
+		}
+		self.Option = append(self.Option, dockerclient.WithHTTPClient(&http.Client{Transport: transport}))
+		return nil
+	}
+}
+
+// 【新增结构体】：延迟加载底层的 Transport
+// 避免在 Client 尚未完全构建完成时发生 HTTPClient() 的空指针异常
+type lazyProxyTransport struct {
+	client *Client
+}
+
+func (t *lazyProxyTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	// 在请求真正发生时，Docker Client 一定已经初始化完毕
+	if t.client != nil && t.client.Client != nil {
+		hc := t.client.Client.HTTPClient()
+		if hc != nil && hc.Transport != nil {
+			return hc.Transport.RoundTrip(req)
+		}
+	}
+	return http.DefaultTransport.RoundTrip(req)
+}
+
+func WithSockProxy() Option {
+	return func(self *Client) error {
+		if self.DockerEnv.RemoteType != define.DockerRemoteTypeSSH {
+			return nil
+		}
+		// 这里稍微延迟一下，防止 ssh 还没有连接完成
+		time.Sleep(time.Second * 2)
+		// 创建代理 sock
+		sockPath := ""
+		if runtime.GOOS == "windows" {
+			sockPath = self.Name
+		} else {
+			localProxySock := filepath.Join(storage.Local{}.GetLocalProxySockPath(), fmt.Sprintf("%s.sock", self.Name))
+			slog.Info("local sock path remove", "path", localProxySock)
+			_ = os.Remove(localProxySock)
+			sockPath = localProxySock
+		}
+		localSock, _, err := listener.New(sockPath)
 		if err != nil {
 			return err
 		}
-		remoteConn, err := sshClient.Conn.Dial("unix", "/var/run/docker.sock")
-		if err != nil {
-			sshClient.Close()
-			return err
+
+		go func() {
+			<-self.Ctx.Done()
+			_ = localSock.Close()
+		}()
+
+		// 【关键优化】：使用标准库 httputil.ReverseProxy 替代原先手写的残缺版代理逻辑
+		proxy := &httputil.ReverseProxy{
+			Director: func(req *http.Request) {
+				req.URL.Scheme = "http"
+				req.URL.Host = "api.dpanel.localhost"
+				// 必须清空 RequestURI，否则 http.Client 拨号会报错
+				req.RequestURI = ""
+			},
+			// 【修复点 2】：利用上面定义的延迟加载器，代替直接读取 self.Client.HTTPClient().Transport
+			Transport: &lazyProxyTransport{client: self},
+			ModifyResponse: func(r *http.Response) error {
+				return nil
+			},
+			ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+				if !errors.Is(err, context.Canceled) {
+					slog.Warn("proxy error", "err", err)
+				}
+			},
 		}
-		_ = remoteConn.Close()
-
-		localProxySock := filepath.Join(storage.Local{}.GetLocalProxySockPath(), fmt.Sprintf("%s.sock", self.Name))
-		_ = os.Remove(localProxySock)
-		listener, _ := net.ListenUnix("unix", &net.UnixAddr{Name: localProxySock})
 
 		go func() {
-			select {
-			case <-self.Ctx.Done():
-				_ = listener.Close()
-				_ = remoteConn.Close()
-				sshClient.Close()
+			server := &http.Server{
+				Handler: proxy,
+			}
+			err := server.Serve(localSock)
+			// 过滤掉因为正常关闭而产生的日志噪音
+			if err != nil && err != http.ErrServerClosed && !strings.Contains(err.Error(), "use of closed network connection") {
+				slog.Warn("local sock proxy exited", "err", err)
 			}
 		}()
 
-		go func() {
-			for {
-				localConn, err := listener.Accept()
-				if err != nil {
-					slog.Warn("docker proxy sock local close", "err", err)
-					return
-				}
-				remoteConn, err := sshClient.Conn.Dial("unix", "/var/run/docker.sock")
-				if err != nil {
-					slog.Warn("docker proxy sock create remote", "err", err)
-					return
-				}
-				go func() {
-					_, _ = io.Copy(remoteConn, localConn)
-					_ = remoteConn.Close()
-				}()
-				go func() {
-					_, _ = io.Copy(localConn, remoteConn)
-					_ = localConn.Close()
-				}()
-			}
-		}()
-		// 清空掉之前的配置
-		self.runParams = make([]string, 0)
-		self.runEnv = make([]string, 0)
-		self.clientOption = make([]client.Opt, 0)
-		return WithAddress("unix://" + localProxySock)(self)
+		return nil
 	}
 }

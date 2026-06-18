@@ -1,18 +1,20 @@
 package controller
 
 import (
+	"net/url"
+	"strings"
+
 	"github.com/docker/docker/api/types/registry"
 	"github.com/donknap/dpanel/common/accessor"
 	"github.com/donknap/dpanel/common/dao"
 	"github.com/donknap/dpanel/common/entity"
 	"github.com/donknap/dpanel/common/function"
 	"github.com/donknap/dpanel/common/service/docker"
+	"github.com/donknap/dpanel/common/types/define"
 	"github.com/donknap/dpanel/common/types/event"
 	"github.com/gin-gonic/gin"
 	"github.com/we7coreteam/w7-rangine-go/v2/pkg/support/facade"
 	"github.com/we7coreteam/w7-rangine-go/v2/src/http/controller"
-	"net/url"
-	"strings"
 )
 
 type Registry struct {
@@ -46,64 +48,62 @@ func (self Registry) Create(http *gin.Context) {
 	if params.Id <= 0 {
 		registryRow, _ = dao.Registry.Where(dao.Registry.ServerAddress.Eq(params.ServerAddress)).First()
 		if registryRow != nil {
-			self.JsonResponseWithError(http, function.ErrorMessage(".commonIdAlreadyExists", "name", params.ServerAddress), 500)
-			return
+			// 类似腾讯云这样的仓库地址一样，如果用户名不一样也按两个仓库来对待
+			if params.Username != "" && params.Password != "" && params.Username == registryRow.Setting.Username {
+				self.JsonResponseWithError(http, function.ErrorMessage(define.ErrorMessageCommonIdAlreadyExists, "name", params.ServerAddress), 500)
+				return
+			}
 		}
 	} else {
 		registryRow, _ = dao.Registry.Where(dao.Registry.ID.Eq(params.Id)).First()
 		if registryRow == nil {
-			self.JsonResponseWithError(http, function.ErrorMessage(".commonDataNotFoundOrDeleted"), 500)
+			self.JsonResponseWithError(http, function.ErrorMessage(define.ErrorMessageCommonDataNotFoundOrDeleted), 500)
 			return
 		}
 		// 如果提交上来密码为空，则使用默认密码
 		if params.Password == "" && registryRow.Setting.Password != "" {
-			code, _ := function.AseDecode(facade.GetConfig().GetString("app.name"), registryRow.Setting.Password)
+			code, _ := function.RSADecode(registryRow.Setting.Password, []byte(facade.GetConfig().GetString("app.name")))
 			params.Password = code
 		}
 	}
 
 	var response registry.AuthenticateOKBody
-	var loginErr error
-
+	authConfig := registry.AuthConfig{
+		Username:      params.Username,
+		Password:      params.Password,
+		ServerAddress: params.ServerAddress,
+		Email:         params.Email,
+	}
+	// 未设置用户名及密码时，这些匿名仓库不做登录操作，因为有可能无法访问
 	if params.Username != "" && params.Password != "" {
-		response, err = docker.Sdk.Client.RegistryLogin(docker.Sdk.Ctx, registry.AuthConfig{
-			Username:      params.Username,
-			Password:      params.Password,
-			ServerAddress: params.ServerAddress,
-			Email:         params.Email,
-		})
-		if err != nil {
-			self.JsonResponseWithError(http, err, 500)
+		response, err = docker.Sdk.Client.RegistryLogin(docker.Sdk.Ctx, authConfig)
+	}
+
+	if err != nil {
+		if function.ErrorHasKeyword(err, "server gave HTTP response to HTTPS client") {
+			self.JsonResponseWithError(http, function.ErrorMessage(define.ErrorMessageImagePullServerHttp, "name", params.ServerAddress), 500)
 			return
 		}
-	} else {
-		if !function.InArray([]string{
-			"docker.io",
-			"quay.io",
-			"ghcr.io",
-		}, params.ServerAddress) {
-			response, loginErr = docker.Sdk.Client.RegistryLogin(docker.Sdk.Ctx, registry.AuthConfig{
-				ServerAddress: params.ServerAddress,
-				Email:         params.Email,
-			})
-		}
+		self.JsonResponseWithError(http, err, 500)
+		return
 	}
 
 	registryNew := &entity.Registry{
 		Title:         params.Title,
 		ServerAddress: params.ServerAddress,
 		Setting: &accessor.RegistrySettingOption{
-			Username:   params.Username,
 			Email:      params.Email,
 			Proxy:      params.Proxy,
-			Password:   "",
 			EnableHttp: params.EnableHttp,
 		},
 	}
-	if params.Password != "" {
-		key := facade.GetConfig().GetString("app.name")
-		code, _ := function.AseEncode(key, params.Password)
-		registryNew.Setting.Password = code
+
+	if strings.Contains(response.Status, "Login Succeeded") {
+		if params.Password != "" {
+			code, _ := function.RSAEncode(params.Password)
+			registryNew.Setting.Password = code
+		}
+		registryNew.Setting.Username = params.Username
 	}
 
 	if params.Id <= 0 {
@@ -115,11 +115,6 @@ func (self Registry) Create(http *gin.Context) {
 
 	if err != nil {
 		self.JsonResponseWithError(http, err, 500)
-		return
-	}
-
-	if loginErr != nil {
-		self.JsonResponseWithError(http, loginErr, 500)
 		return
 	}
 
@@ -182,56 +177,14 @@ func (self Registry) GetDetail(http *gin.Context) {
 	}
 	registryItem, _ := dao.Registry.Where(dao.Registry.ID.Eq(params.Id)).First()
 	if registryItem == nil {
-		self.JsonResponseWithError(http, function.ErrorMessage(".commonDataNotFoundOrDeleted"), 500)
+		self.JsonResponseWithError(http, function.ErrorMessage(define.ErrorMessageCommonDataNotFoundOrDeleted), 500)
 		return
 	}
 	if registryItem.Setting != nil && registryItem.Setting.Password != "" {
-		key := facade.GetConfig().GetString("app.name")
-		registryItem.Setting.Password, _ = function.AseDecode(key, registryItem.Setting.Password)
+		registryItem.Setting.Password, _ = function.RSADecode(registryItem.Setting.Password, []byte(facade.GetConfig().GetString("app.name")))
 	}
 	self.JsonResponseWithoutError(http, gin.H{
 		"info": registryItem,
-	})
-	return
-}
-
-func (self Registry) Update(http *gin.Context) {
-	type ParamsValidate struct {
-		Id            int32    `json:"id" binding:"required"`
-		Title         string   `json:"title"`
-		ServerAddress string   `json:"serverAddress"`
-		Username      string   `json:"username"`
-		Password      string   `json:"password"`
-		Proxy         []string `json:"proxy"`
-	}
-	params := ParamsValidate{}
-	if !self.Validate(http, &params) {
-		return
-	}
-	row, _ := dao.Registry.Where(dao.Registry.ID.Eq(params.Id)).First()
-	if row == nil {
-		self.JsonResponseWithError(http, function.ErrorMessage(".commonDataNotFoundOrDeleted"), 500)
-		return
-	}
-	password := row.Setting.Password
-	if params.Password != "" {
-		password, _ = function.AseEncode(facade.GetConfig().GetString("app.name"), params.Password)
-	}
-	_, err := dao.Registry.Where(dao.Registry.ID.Eq(params.Id)).Updates(&entity.Registry{
-		Title:         params.Title,
-		ServerAddress: params.ServerAddress,
-		Setting: &accessor.RegistrySettingOption{
-			Username: params.Username,
-			Password: password,
-		},
-	})
-	if err != nil {
-		self.JsonResponseWithError(http, err, 500)
-		return
-	}
-
-	self.JsonResponseWithoutError(http, gin.H{
-		"id": params.Id,
 	})
 	return
 }
@@ -247,7 +200,7 @@ func (self Registry) Delete(http *gin.Context) {
 
 	rows, _ := dao.Registry.Where(dao.Registry.ID.In(params.Id...)).Find()
 	if rows == nil || len(rows) == 0 {
-		self.JsonResponseWithError(http, function.ErrorMessage(".commonDataNotFoundOrDeleted"), 500)
+		self.JsonResponseWithError(http, function.ErrorMessage(define.ErrorMessageCommonDataNotFoundOrDeleted), 500)
 		return
 	}
 

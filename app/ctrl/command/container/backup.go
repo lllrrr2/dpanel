@@ -4,6 +4,7 @@ import (
 	"github.com/donknap/dpanel/app/ctrl/sdk/proxy"
 	"github.com/donknap/dpanel/app/ctrl/sdk/types/app"
 	"github.com/donknap/dpanel/app/ctrl/sdk/utils"
+	"github.com/donknap/dpanel/common/function"
 	"github.com/spf13/cobra"
 	"github.com/we7coreteam/w7-rangine-go/v2/src/console"
 )
@@ -17,20 +18,26 @@ func (self Backup) GetName() string {
 }
 
 func (self Backup) GetDescription() string {
-	return "生成容器快照"
+	return "Create a container backup snapshot"
 }
 
 func (self Backup) Configure(command *cobra.Command) {
-	command.Flags().String("name", "", "容器名称")
-	command.Flags().Int("enable-image", 0, "是否快照容器镜像")
-	command.Flags().String("docker-env", "", "指定 docker 环境")
+	command.Flags().String("docker-env", "local", "Docker server name")
+	command.Flags().String("name", "", "Name of the container to backup")
+	command.Flags().Bool("enable-image", false, "Enable container image backup")
+	command.Flags().String("backup-image", "", "Backup image type: 'image' (registry image) or 'container' (commit container)")
+	command.Flags().Bool("enable-volume", false, "Enable backup of mounted volumes")
+	command.Flags().StringArray("backup-volume", []string{}, "Specific volume mount to backup")
 	_ = command.MarkFlagRequired("name")
 }
 
 func (self Backup) Handle(cmd *cobra.Command, args []string) {
 	name, _ := cmd.Flags().GetString("name")
 	dockerEnv, _ := cmd.Flags().GetString("docker-env")
-	enableImage, _ := cmd.Flags().GetInt("enable-image")
+	enableImage, _ := cmd.Flags().GetBool("enable-image")
+	backupImage, _ := cmd.Flags().GetString("backup-image")
+	enableVolume, _ := cmd.Flags().GetBool("enable-volume")
+	backupVolumeList, _ := cmd.Flags().GetStringArray("backup-volume")
 
 	proxyClient, err := proxy.NewProxyClient()
 	if err != nil {
@@ -52,12 +59,24 @@ func (self Backup) Handle(cmd *cobra.Command, args []string) {
 			_ = proxyClient.CommonEnvSwitch(dockerEnvList.CurrentName)
 		}()
 	}
-	result, err := proxyClient.AppContainerBackupCreate(&app.ContainerBackupOption{
-		Id:                name,
-		EnableImage:       enableImage > 0,
-		EnableCommitImage: false,
-		Volume:            make([]string, 0),
-	})
+	params := &app.ContainerBackupOption{
+		Id:           name,
+		BackupVolume: "none",
+		BackupImage:  "none",
+	}
+	if enableImage {
+		params.BackupImage = "image"
+	}
+	if backupImage != "" {
+		params.BackupImage = backupImage
+	}
+	if enableVolume {
+		params.BackupVolume = "all"
+	}
+	if !function.IsEmptyArray(backupVolumeList) {
+		params.BackupVolumeList = backupVolumeList
+	}
+	result, err := proxyClient.AppContainerBackupCreate(params)
 	if err != nil {
 		utils.Result{}.Error(err)
 		return

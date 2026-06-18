@@ -9,13 +9,13 @@ import (
 	"github.com/donknap/dpanel/common/service/crontab"
 	"github.com/donknap/dpanel/common/service/docker"
 	"github.com/donknap/dpanel/common/service/storage"
+	"github.com/donknap/dpanel/common/types/define"
 	"github.com/gin-gonic/gin"
 	"github.com/robfig/cron/v3"
 	"github.com/we7coreteam/w7-rangine-go/v2/pkg/support/facade"
 	"github.com/we7coreteam/w7-rangine-go/v2/src/http/controller"
 	"gorm.io/datatypes"
 	"gorm.io/gen"
-	"time"
 )
 
 type Cron struct {
@@ -24,28 +24,29 @@ type Cron struct {
 
 func (self Cron) Create(http *gin.Context) {
 	type ParamsValidate struct {
-		Id             int32                            `json:"id"`
-		Title          string                           `json:"title" binding:"required"`
-		Expression     []accessor.CronSettingExpression `json:"expression" binding:"required"`
-		ContainerName  string                           `json:"containerName"`
-		Script         string                           `json:"script" binding:"required"`
-		Environment    []docker.EnvItem                 `json:"environment"`
-		EnableRunBlock bool                             `json:"enableRunBlock"`
-		KeepLogTotal   int                              `json:"keepLogTotal"`
-		Disable        bool                             `json:"disable"`
+		Id    int32  `json:"id"`
+		Title string `json:"title" binding:"required"`
+		accessor.CronSettingOption
 	}
 	params := ParamsValidate{}
 	if !self.Validate(http, &params) {
 		return
 	}
 
-	allExpression := make([]string, 0)
-	for _, expression := range params.Expression {
-		allExpression = append(allExpression, expression.ToString())
+	if params.TriggerType != accessor.CronTriggerTypeCron {
+		params.Expression = []accessor.CronSettingExpression{
+			{
+				Unit: "code",
+				Code: "@manual",
+			},
+		}
 	}
-	err := crontab.Wrapper.CheckExpression(allExpression)
+
+	err := crontab.Client.CheckExpression(function.PluckArrayWalk(params.Expression, func(item accessor.CronSettingExpression) (string, bool) {
+		return item.ToString(), true
+	})...)
 	if err != nil {
-		self.JsonResponseWithError(http, function.ErrorMessage(".containerCronExpressionInCorrect", "message", err.Error()), 500)
+		self.JsonResponseWithError(http, function.ErrorMessage(define.ErrorMessageContainerCronExpressionInCorrect, "message", err.Error()), 500)
 		return
 	}
 
@@ -53,55 +54,40 @@ func (self Cron) Create(http *gin.Context) {
 	if params.Id > 0 {
 		taskRow, _ = dao.Cron.Where(dao.Cron.ID.Eq(params.Id)).First()
 		if taskRow == nil {
-			self.JsonResponseWithError(http, function.ErrorMessage(".commonDataNotFoundOrDeleted"), 500)
+			self.JsonResponseWithError(http, function.ErrorMessage(define.ErrorMessageCommonDataNotFoundOrDeleted), 500)
 			return
 		}
-		crontab.Wrapper.RemoveJob(taskRow.Setting.JobIds...)
+		crontab.Client.RemoveJob(taskRow.Setting.JobIds...)
+		taskRow.Setting = &params.CronSettingOption
 		taskRow.Title = params.Title
-		taskRow.Setting.NextRunTime = make([]time.Time, 0)
 		taskRow.Setting.JobIds = make([]cron.EntryID, 0)
-		taskRow.Setting.Expression = params.Expression
-		taskRow.Setting.Script = params.Script
-		taskRow.Setting.ContainerName = params.ContainerName
-		taskRow.Setting.EnableRunBlock = params.EnableRunBlock
-		taskRow.Setting.Environment = params.Environment
-		taskRow.Setting.KeepLogTotal = params.KeepLogTotal
-		taskRow.Setting.Disable = params.Disable
 		taskRow.Setting.DockerEnvName = docker.Sdk.Name
 	} else {
 		if _, err := dao.Cron.Where(dao.Cron.Title.Like(params.Title)).First(); err == nil {
-			self.JsonResponseWithError(http, function.ErrorMessage(".commonIdAlreadyExists", "name", params.Title), 500)
+			self.JsonResponseWithError(http, function.ErrorMessage(define.ErrorMessageCommonIdAlreadyExists, "name", params.Title), 500)
 			return
 		}
 		taskRow = &entity.Cron{
-			Title: params.Title,
-			Setting: &accessor.CronSettingOption{
-				NextRunTime:    make([]time.Time, 0),
-				Expression:     params.Expression,
-				ContainerName:  params.ContainerName,
-				Script:         params.Script,
-				JobIds:         make([]cron.EntryID, 0),
-				EnableRunBlock: params.EnableRunBlock,
-				Environment:    params.Environment,
-				KeepLogTotal:   params.KeepLogTotal,
-				Disable:        params.Disable,
-				DockerEnvName:  docker.Sdk.Name,
-			},
+			Title:   params.Title,
+			Setting: &params.CronSettingOption,
 		}
-		err = dao.Cron.Create(taskRow)
+		taskRow.Setting.JobIds = make([]cron.EntryID, 0)
+		taskRow.Setting.DockerEnvName = docker.Sdk.Name
+		_ = dao.Cron.Create(taskRow)
 	}
-	if !params.Disable {
-		jobIds, err := logic.Cron{}.AddJob(taskRow)
-		if err == nil {
-			taskRow.Setting.NextRunTime = crontab.Wrapper.GetNextRunTime(jobIds...)
+	// 仅当任务非手动触发的时候，才有暂停和恢复功能
+	if taskRow.Setting.TriggerType == accessor.CronTriggerTypeManual || !params.Disable {
+		if jobIds, err := (logic.Cron{}).AddCronJob(taskRow); err == nil {
 			taskRow.Setting.JobIds = jobIds
 		}
 	}
-	_ = dao.Cron.Save(taskRow)
+
+	err = dao.Cron.Save(taskRow)
 	if err != nil {
 		self.JsonResponseWithError(http, err, 500)
 		return
 	}
+
 	self.JsonSuccessResponse(http)
 	return
 }
@@ -122,7 +108,12 @@ func (self Cron) GetList(http *gin.Context) {
 	}
 	list, _ := query.Find()
 	self.JsonResponseWithoutError(http, gin.H{
-		"list": list,
+		"list": function.PluckArrayWalk(list, func(item *entity.Cron) (*entity.Cron, bool) {
+			if item.Setting.TriggerType == accessor.CronTriggerTypeCron {
+				item.Setting.NextRunTime = crontab.Client.GetNextRunTime(item.Setting.JobIds...)
+			}
+			return item, true
+		}),
 	})
 	return
 }
@@ -137,7 +128,7 @@ func (self Cron) Delete(http *gin.Context) {
 	}
 	if list, err := dao.Cron.Where(dao.Cron.ID.In(params.Id...)).Find(); err == nil {
 		for _, item := range list {
-			crontab.Wrapper.RemoveJob(item.Setting.JobIds...)
+			crontab.Client.RemoveJob(item.Setting.JobIds...)
 			_, _ = dao.Cron.Delete(item)
 			_, _ = dao.CronLog.Where(dao.CronLog.CronID.Eq(item.ID)).Delete()
 		}
@@ -156,14 +147,17 @@ func (self Cron) RunOnce(http *gin.Context) {
 	}
 	cronRow, _ := dao.Cron.Where(dao.Cron.ID.In(params.Id)).First()
 	if cronRow == nil {
-		self.JsonResponseWithError(http, function.ErrorMessage(".commonDataNotFoundOrDeleted"), 500)
+		self.JsonResponseWithError(http, function.ErrorMessage(define.ErrorMessageCommonDataNotFoundOrDeleted), 500)
 		return
 	}
-	if cronRow.Setting.JobIds == nil || len(cronRow.Setting.Expression) == 0 {
-		self.JsonResponseWithError(http, function.ErrorMessage(".containerCronTaskEmpty"), 500)
+	if cronRow.Setting.JobIds == nil {
+		self.JsonResponseWithError(http, function.ErrorMessage(define.ErrorMessageContainerCronTaskEmpty), 500)
 		return
 	}
-	crontab.Wrapper.Cron.Entry(cronRow.Setting.JobIds[0]).Job.Run()
+
+	// 计划任务可能会注册多个周期，执行时也只需要调用一次即可
+	crontab.Client.RunById(cronRow.Setting.JobIds[0])
+
 	self.JsonSuccessResponse(http)
 	return
 }
@@ -178,7 +172,7 @@ func (self Cron) GetDetail(http *gin.Context) {
 	}
 	cronRow, _ := dao.Cron.Where(dao.Cron.ID.In(params.Id)).First()
 	if cronRow == nil {
-		self.JsonResponseWithError(http, function.ErrorMessage(".commonDataNotFoundOrDeleted"), 500)
+		self.JsonResponseWithError(http, function.ErrorMessage(define.ErrorMessageCommonDataNotFoundOrDeleted), 500)
 		return
 	}
 	self.JsonResponseWithoutError(http, gin.H{
@@ -190,8 +184,8 @@ func (self Cron) GetDetail(http *gin.Context) {
 func (self Cron) GetLogList(http *gin.Context) {
 	type ParamsValidate struct {
 		Id       int32 `json:"id" binding:"required"`
-		Page     int   `form:"page,default=1" binding:"omitempty,gt=0"`
-		PageSize int   `form:"pageSize" binding:"omitempty"`
+		Page     int   `json:"page" binding:"omitempty,gt=0"`
+		PageSize int   `json:"pageSize" binding:"omitempty"`
 	}
 	params := ParamsValidate{}
 	if !self.Validate(http, &params) {
@@ -221,8 +215,10 @@ func (self Cron) PruneLog(http *gin.Context) {
 		return
 	}
 
-	oldRow, _ := dao.CronLog.Where(dao.CronLog.CronID.Eq(params.Id)).Last()
-	_, _ = dao.CronLog.Where(dao.CronLog.ID.Lte(oldRow.ID)).Delete()
+	if oldRow, err := dao.CronLog.Where(dao.CronLog.CronID.Eq(params.Id)).Last(); err == nil {
+		_, _ = dao.CronLog.Where(dao.CronLog.ID.Lte(oldRow.ID)).Delete()
+	}
+
 	db, err := facade.GetDbFactory().Channel("default")
 	if err != nil {
 		self.JsonResponseWithError(http, err, 500)

@@ -1,15 +1,35 @@
 package storage
 
 import (
-	"github.com/patrickmn/go-cache"
+	"fmt"
 	"time"
+
+	"github.com/patrickmn/go-cache"
 )
 
 var (
-	CacheKeyImageRemoteList  = "image:remoteTag:%s"
-	CacheKeyExplorerUsername = "explorer:%s:uid:%d"
-	CacheKeyCommonUserInfo   = "user:%d"
-	CacheKeyXkStorageInfo    = "xk:storageInfo"
+	CacheKeyExplorerUsername       = "explorer:%s:uid:%d"
+	CacheKeyExplorerAfs            = "explorer:%s"
+	CacheKeyCommonUserInfo         = "user:%d"
+	CacheKeyCommonServerStartTime  = "server:startTime"
+	CacheKeyXkStorageInfo          = "xk:storageInfo"
+	CacheKeyLoginFailed            = "login:failed:%s"
+	CacheKeyOauthState             = "oauth:state:%s"
+	CacheKeyOauthCode              = "oauth:code:%s"
+	CacheKeySetting                = "setting:%s"
+	CacheKeySettingLocale          = fmt.Sprintf(CacheKeySetting, "locale")
+	CacheKeyImageDigest            = "image:digest:%s"
+	CacheKeyImageRootFs            = "image:rootfs:%s"
+	CacheKeyDockerStatus           = "docker:status:%s"
+	CacheKeyDockerEvents           = "docker:events"
+	CacheKeyDockerContainerRuntime = "docker:container:runtime:%s:%s"
+	CacheKeyConsoleData            = "console:data:%s" // 用于脚本存储一些自定义数据
+	CacheKeyCronTaskStatus         = "cron:task:status:%d"
+	CacheKeyDockerEventJob         = "docker:event:%s:%s"
+	CacheKeyRsaKey                 = "rsa:key"
+	CacheKeyRsaPub                 = "rsa:pub"
+	CacheKeyAttach                 = "attach:%s"
+	CacheKeyAsset                  = "asset"
 )
 
 var (

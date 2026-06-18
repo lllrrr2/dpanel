@@ -1,74 +1,104 @@
-map $scheme $hsts_header {
-    https   "max-age=63072000; preload";
-}
+# Created by DPanel. DO NOT EDIT OR DELETE!!!
 
-upstream {{.TargetName}} {
-  server {{.ServerAddress}}:{{.Port}};
-}
-
-{{if .EnableSSL}}
+{{if and .enableSSL (eq (print .serverPort) "443")}}
 server {
     listen 80;
-    server_name {{.ServerName}} {{range $index, $value := .ServerNameAlias}}{{$value}} {{end}};
+    listen [::]:80;
+    server_name {{.serverName}} {{range $index, $value := .serverNameAlias}}{{$value}} {{end}};
 
-    location / {
-        return 301 https://$host$request_uri;
-    }
+    return 301 https://$host$request_uri;
 }
 {{end}}
 
 server {
-  set $forward_scheme {{.ServerProtocol}};
-  {{if .EnableSSL}}
-  listen 443 ssl;
-  {{else}}
-  listen 80;
-  {{end}}
+    set $forward_scheme {{.serverProtocol}};
 
-  server_name {{.ServerName}} {{range $index, $value := .ServerNameAlias}}{{$value}} {{end}};
+    {{if .enableSSL}}
+    listen {{.serverPort}} ssl;
+    listen [::]:{{.serverPort}} ssl;
+    # http2 on;
 
-  {{if .EnableSSL}}
-  ssl_certificate {{.SslCrt}};
-  ssl_certificate_key {{.SslKey}};
-  ssl_session_cache shared:SSL:1m;
-  ssl_session_timeout 5m;
-  ssl_ciphers ECDHE-RSA-AES128-GCM-SHA256:ECDHE:ECDH:AES:HIGH:!NULL:!aNULL:!MD5:!ADH:!RC4;
-  ssl_protocols TLSv1.1 TLSv1.2 TLSv1.3;
-  ssl_prefer_server_ciphers on;
-  {{end}}
+    error_page 497 =307 https://$host:$server_port$request_uri;
 
-  {{if .EnableAssetCache}}
-  # Asset Caching
-  include /etc/nginx/conf.d/include/assets.conf;
-  {{end}}
-  {{if .EnableBlockCommonExploits}}
-  # Block Exploits
-  include /etc/nginx/conf.d/include/block-exploits.conf;
-  {{end}}
-
-  {{if .EnableWs}}
-  proxy_set_header Upgrade $http_upgrade;
-  proxy_set_header Connection $http_connection;
-  proxy_http_version 1.1;
-  {{end}}
-
- {{.ExtraNginx}}
-
-  location / {
-    {{if .EnableWs}}
-    proxy_set_header Upgrade $http_upgrade;
-    proxy_set_header Connection $http_connection;
-    proxy_http_version 1.1;
+    ssl_certificate {{.sslCrt}};
+    ssl_certificate_key {{.sslKey}};
+    ssl_session_cache shared:SSL:1m;
+    ssl_session_timeout 5m;
+    ssl_ciphers ECDHE-RSA-AES128-GCM-SHA256:ECDHE:ECDH:AES:HIGH:!NULL:!aNULL:!MD5:!ADH:!RC4;
+    ssl_protocols TLSv1.1 TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers on;
+    add_header Strict-Transport-Security "max-age=63072000; preload" always;
+    {{else}}
+    listen {{.serverPort}};
+    listen [::]:{{.serverPort}};
     {{end}}
 
-    add_header       X-Served-By $host;
+    server_name {{.serverName}} {{range $index, $value := .serverNameAlias}}{{$value}} {{end}};
 
-    proxy_set_header Host $host;
-    proxy_set_header X-Forwarded-Scheme $scheme;
-    proxy_set_header X-Forwarded-Proto  $scheme;
-    proxy_set_header X-Forwarded-For    $proxy_add_x_forwarded_for;
-    proxy_set_header X-Real-IP          $remote_addr;
-    proxy_pass       $forward_scheme://{{.TargetName}}$request_uri;
-  }
+    include /etc/nginx/conf.d/include/resolver.conf;
 
+    {{if .enableAssetCache}}
+    # Asset Caching
+    include /etc/nginx/conf.d/include/assets.conf;
+    {{end}}
+
+    {{if .enableBlockCommonExploits}}
+    # Block Exploits
+    include /etc/nginx/conf.d/include/block-exploits.conf;
+    {{end}}
+
+    {{if .extraNginx}}
+    # Extra Nginx Configuration
+    include /dpanel/nginx/extra_host/{{.serverName}}.conf;
+    {{end}}
+
+    {{if eq .type "proxy"}}
+    location / {
+        {{if .enableWs}}
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+        proxy_http_version 1.1;
+        {{end}}
+
+        add_header X-Served-By $host;
+
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-Scheme $scheme;
+        proxy_set_header X-Forwarded-Proto  $scheme;
+        proxy_set_header X-Forwarded-For    $proxy_add_x_forwarded_for;
+        proxy_set_header X-Real-IP          $remote_addr;
+
+        {{if eq .serverAddress "host.dpanel.local"}}
+        proxy_pass $forward_scheme://host.dpanel.local:{{.port}}$request_uri;
+        {{else}}
+        set $upstream_endpoint {{.serverAddress}}:{{.port}};
+        proxy_pass $forward_scheme://$upstream_endpoint$request_uri;
+        {{end}}
+    }
+    {{end}}
+
+    {{if eq .type "redirect"}}
+    location / {
+        return 301 $forward_scheme://{{.serverAddress}}:{{.port}}$request_uri;
+    }
+    {{end}}
+
+    {{if eq .type "fpm"}}
+    root {{.wwwRoot}};
+    index index.php index.html index.htm;
+    location ~ \.php$ {
+        try_files $uri =404;
+        {{if eq .serverAddress "host.dpanel.local"}}
+        fastcgi_pass host.dpanel.local:{{.port}};
+        {{else}}
+        set $upstream_endpoint {{.serverAddress}}:{{.port}};
+        fastcgi_pass $upstream_endpoint;
+        {{end}}
+        fastcgi_index index.php;
+        fastcgi_param SCRIPT_FILENAME {{.fpmRoot}}$fastcgi_script_name;
+        include fastcgi_params;
+
+        fastcgi_intercept_errors off;
+    }
+    {{end}}
 }

@@ -4,19 +4,19 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"github.com/donknap/dpanel/app/common/logic"
-	"github.com/gin-gonic/gin"
-	"github.com/gorilla/websocket"
 	"log/slog"
 	"net/http"
 	"runtime"
 	"sync"
 	"time"
+
+	"github.com/donknap/dpanel/app/common/logic"
+	"github.com/gin-gonic/gin"
+	"github.com/gorilla/websocket"
 )
 
 var (
-	collect         = NewCollection()
-	sendMessageLock = sync.RWMutex{}
+	collect = NewCollection()
 )
 
 func NewClient(ctx *gin.Context, options ...Option) (*Client, error) {
@@ -27,7 +27,7 @@ func NewClient(ctx *gin.Context, options ...Option) (*Client, error) {
 			Type string `json:"type"`
 			Data string `json:"data"`
 		}{}
-		slog.Debug("ws event", "event", MessageTypeProgressClose, "fd", fd, "message", string(message.Message))
+		slog.Info("ws event", "event", MessageTypeProgressClose, "fd", fd, "message", string(message.Message))
 		if err := json.Unmarshal(message.Message, &closeMessage); err == nil {
 			if p, ok := collect.progressPip.Load(closeMessage.Data); ok {
 				if v, ok := p.(*ProgressPip); ok {
@@ -73,6 +73,7 @@ type Client struct {
 	Conn               *websocket.Conn // 当前 ws 连接
 	CtxCancelFunc      context.CancelFunc
 	CtxContext         context.Context
+	writeLock          sync.Mutex
 	recvMessageHandler map[string]RecvMessageHandlerFn
 }
 
@@ -87,7 +88,7 @@ func (self *Client) ReadMessage() {
 				slog.Info("stop read message goroutine", "fd", self.Fd)
 				err = self.Close()
 				if err != nil {
-					slog.Error("websocket", "client close", err)
+					slog.Warn("websocket", "client close", err)
 				}
 				return
 			}
@@ -98,10 +99,7 @@ func (self *Client) ReadMessage() {
 				RecvAt:  time.Now().Unix(),
 			}
 			if recv.IsPing() {
-				BroadcastMessage <- &RespMessage{
-					Type: MessageTypeEvent,
-					Data: "pong",
-				}
+				BroadcastMessage <- NewRespMessage("", MessageTypeEvent, "pong")
 				continue
 			}
 			content := recvMessageContent{}
@@ -117,8 +115,11 @@ func (self *Client) ReadMessage() {
 }
 
 func (self *Client) SendMessage(message *RespMessage) error {
-	sendMessageLock.Lock()
-	defer sendMessageLock.Unlock()
+	if message.Data == nil {
+		return nil
+	}
+	self.writeLock.Lock()
+	defer self.writeLock.Unlock()
 	err := self.Conn.WriteMessage(websocket.TextMessage, message.ToJson())
 	if err != nil {
 		return err

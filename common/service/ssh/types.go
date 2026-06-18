@@ -2,13 +2,15 @@ package ssh
 
 import (
 	"context"
+
 	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
 )
 
 const (
-	SshAuthTypeBasic = "basic"
-	SshAuthTypePem   = "pem"
+	SshAuthTypeBasic      = "basic"
+	SshAuthTypePem        = "pem"
+	SshAuthTypePemDefault = "pemDefault"
 )
 
 type Client struct {

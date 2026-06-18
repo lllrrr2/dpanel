@@ -1,8 +1,77 @@
 package define
 
-import "github.com/donknap/dpanel/common/function"
+import "errors"
+
+const (
+	ErrorMessageUnknow                                      = ".unknow"
+	ErrorMessageCommonDataNotFoundOrDeleted                 = ".commonDataNotFoundOrDeleted"
+	ErrorMessageCommonNotFoundDPanel                        = ".commonNotFoundDPanel"
+	ErrorMessageCommonIdAlreadyExists                       = ".commonIdAlreadyExists"
+	ErrorMessageCommonUploadFileEmpty                       = ".commonUploadFileEmpty"
+	ErrorMessageCommonUseWsConnect                          = ".commonUseWsConnect"
+	ErrorMessageCommonCancelOperator                        = ".commonCancelOperator"
+	ErrorMessageProLicenseParseErr                          = ".proLicenseFileIsCorrect"
+	ErrorMessageXkLicenseParseErr                           = ".xkLicenseFileIsCorrect"
+	ErrorMessageComposeDeleteFileMustDeleteTask             = ".composeDeleteFileMustDeleteTask"
+	ErrorMessageComposeNotFoundYaml                         = ".composeNotFoundYaml"
+	ErrorMessageComposeDisableStorageType                   = ".composeDisableStorageType"
+	ErrorMessageComposeDisableStore                         = ".composeDisableStore"
+	ErrorMessageComposeParseYamlIncorrect                   = ".composeParseYamlIncorrect"
+	ErrorMessageComposeDeployIncorrect                      = ".composeDeployIncorrect"
+	ErrorMessageContainerUpgradeDPanel                      = ".containerUpgradeDPanel"
+	ErrorMessageContainerExplorerInvalidFilename            = ".containerExplorerInvalidFilename"
+	ErrorMessageContainerExplorerUnzipTargetUnsupportedType = ".containerExplorerUnzipTargetUnsupportedType"
+	ErrorMessageContainerExplorerEditDeleteUnsafe           = ".containerExplorerEditDeleteUnsafe"
+	ErrorMessageContainerExplorerEditFileMaxSize            = ".containerExplorerEditFileMaxSize"
+	ErrorMessageContainerExplorerContentUnsupportedType     = ".containerExplorerContentUnsupportedType"
+	ErrorMessageContainerCronExpressionInCorrect            = ".containerCronExpressionInCorrect"
+	ErrorMessageContainerCronTaskEmpty                      = ".containerCronTaskEmpty"
+	ErrorMessageContainerBackupImportFileFailed             = ".containerBackupImportFileFailed"
+	ErrorMessageContainerBackupImportFileInCorrect          = ".containerBackupImportFileInCorrect"
+	ErrorMessageContainerBackupRestoreImportImageFailed     = ".containerBackupRestoreImportImageFailed"
+	ErrorMessageSiteDomainExists                            = ".siteDomainExists"
+	ErrorMessageSiteDomainNotFoundDPanel                    = ".siteDomainNotFoundDPanel"
+	ErrorMessageSiteDomainJoinDefaultNetworkFailed          = ".siteDomainJoinDefaultNetworkFailed"
+	ErrorMessageSiteDomainCertIssueFailed                   = ".siteDomainCertIssueFailed"
+	ErrorMessageSiteDomainCertAddTxtFailed                  = ".siteDomainCertAddTxtFailed"
+	ErrorMessageSiteDomainCertHasBindDomain                 = ".siteDomainCertHasBindDomain"
+	ErrorMessageSiteDomainCertHasNotDNSName                 = ".siteDomainCertHasNotDNSName"
+	ErrorMessageImagePullTagNotFound                        = ".imagePullTagNotFound"
+	ErrorMessageImagePullServerHttp                         = ".imagePullServerHttp"
+	ErrorMessageImagePullRegistryBad                        = ".imagePullRegistryBad"
+	ErrorMessageImageRemoteTagNoPermission                  = ".imageRemoteTagNoPermission"
+	ErrorMessageImageBuildTypeEmpty                         = ".imageBuildTypeEmpty"
+	ErrorMessageImageBuildTypeConflict                      = ".imageBuildTypeConflict"
+	ErrorMessageImageBuildError                             = ".imageBuildError"
+	ErrorMessageSwarmNotInit                                = ".swarmNotInit"
+	ErrorMessageSwarmNotManager                             = ".swarmNotManager"
+	ErrorMessageSystemEnvTlsInvalidCert                     = ".systemEnvTlsInvalidCert"
+	ErrorMessageSystemEnvApiTooOld                          = ".systemEnvApiTooOld"
+	ErrorMessageSystemEnvDockerApiFailed                    = ".systemEnvDockerApiFailed"
+	ErrorMessageSystemEnvCurrentCanNotDelete                = ".systemEnvCurrentCanNotDelete"
+	ErrorMessageSystemStoreNotFoundGit                      = ".systemStoreNotFoundGit"
+	ErrorMessageSystemStoreDownloadFailed                   = ".systemStoreDownloadFailed"
+	ErrorMessageSettingBasicEmailInvalid                    = ".settingBasicEmailInvalid"
+	ErrorMessageUserUsernameOrPasswordError                 = ".usernameOrPasswordError"
+	ErrorMessageUserTwoFaEmpty                              = ".userTwoFaEmpty"
+	ErrorMessageUserTwoFaNotCorrect                         = ".userTwoFaNotCorrect"
+	ErrorMessageUserLogin                                   = ".unauthorized"
+	ErrorMessageUserFounderExists                           = ".userFounderExists"
+	ErrorMessageUserPasswordConfirmFailed                   = ".userPasswordConfirmFailed"
+	ErrorMessageUserDisable                                 = ".userDisable"
+	ErrorMessageUserFailedLockForever                       = ".userFailedLockForever"
+	ErrorMessageUserFailedLock                              = ".userFailedLock"
+	ErrorMessageUserResetTokenExpire                        = ".userResetTokenExpire"
+	ErrorMessageUserNoPermission                            = ".userNoPermission"
+	ErrorMessageHomeWsHostConsoleSshNotSetting              = ".homeWsHostConsoleSshNotSetting"
+	ErrorMessageTagUrlNotFound                              = ".tagUrlNotFound"
+)
+
+const (
+	InfoMessageCommonExportInPath = ".commonExportInPath"
+)
 
 var (
-	ErrorMessageCommonDataNotFoundOrDeleted = function.ErrorMessage(".commonDataNotFoundOrDeleted")
-	ErrorMessageCommonNotFoundDPanel        = function.ErrorMessage(".commonNotFoundDPanel")
+	ErrorImageTagEmpty = errors.New("image tag name is required")
+	ErrorAssetEmpty    = errors.New("static resources not initialized")
 )

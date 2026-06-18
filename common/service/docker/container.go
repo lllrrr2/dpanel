@@ -5,19 +5,22 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/api/types/filters"
-	"github.com/docker/docker/api/types/versions"
-	"github.com/donknap/dpanel/common/function"
 	"io"
 	"log/slog"
 	"os"
 	"strings"
+
+	"github.com/docker/docker/api/types"
+	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/filters"
+	"github.com/docker/docker/api/types/versions"
+	"github.com/docker/docker/pkg/stdcopy"
+	"github.com/donknap/dpanel/common/function"
+	"github.com/donknap/dpanel/common/types/define"
 )
 
 // ContainerByField 获取单条容器 field 支持 id,name
-func (self Builder) ContainerByField(ctx context.Context, field string, name ...string) (result map[string]*container.Summary, err error) {
+func (self Client) ContainerByField(ctx context.Context, field string, name ...string) (result map[string]*container.Summary, err error) {
 	if len(name) == 0 {
 		return nil, errors.New("please specify a container name")
 	}
@@ -35,7 +38,7 @@ func (self Builder) ContainerByField(ctx context.Context, field string, name ...
 	filtersArgs.Add("status", "exited")
 	filtersArgs.Add("status", "dead")
 
-	containerList, err := Sdk.Client.ContainerList(ctx, container.ListOptions{
+	containerList, err := self.Client.ContainerList(ctx, container.ListOptions{
 		Filters: filtersArgs,
 	})
 	if err != nil {
@@ -61,16 +64,13 @@ func (self Builder) ContainerByField(ctx context.Context, field string, name ...
 	return result, nil
 }
 
-func (self Builder) ContainerImport(ctx context.Context, containerName string, importFile *ImportFile) error {
+func (self Client) ContainerImport(ctx context.Context, containerName string, dstPath string, reader io.Reader) error {
 	err := self.Client.CopyToContainer(ctx,
 		containerName,
-		"/",
-		importFile.Reader(),
+		dstPath,
+		reader,
 		container.CopyToContainerOptions{},
 	)
-	defer func() {
-		importFile.Close()
-	}()
 	if err != nil {
 		return err
 	}
@@ -78,16 +78,16 @@ func (self Builder) ContainerImport(ctx context.Context, containerName string, i
 }
 
 // ContainerCopyInspect 获取复制容器信息，兼容低版本的配置情况
-func (self Builder) ContainerCopyInspect(ctx context.Context, containerName string) (info container.InspectResponse, err error) {
-	info, err = Sdk.Client.ContainerInspect(ctx, containerName)
+func (self Client) ContainerCopyInspect(ctx context.Context, containerName string) (info container.InspectResponse, err error) {
+	info, err = self.Client.ContainerInspect(ctx, containerName)
 	if err != nil {
 		return info, err
 	}
-	return self.ContainerInspectCompat(info)
+	return self.ContainerInspectCompact(info)
 }
 
-func (self Builder) ContainerInspectCompat(info container.InspectResponse) (container.InspectResponse, error) {
-	if versions.LessThanOrEqualTo(Sdk.Client.ClientVersion(), "1.44") {
+func (self Client) ContainerInspectCompact(info container.InspectResponse) (container.InspectResponse, error) {
+	if versions.LessThanOrEqualTo(self.Client.ClientVersion(), "1.44") {
 		macAddress := ""
 		for name, settings := range info.NetworkSettings.Networks {
 			if settings.MacAddress != "" {
@@ -103,44 +103,45 @@ func (self Builder) ContainerInspectCompat(info container.InspectResponse) (cont
 	return info, nil
 }
 
-// ExecResult 在容器中执行一条命令，返回结果
-func (self Builder) ContainerExecResult(ctx context.Context, containerName string, cmd string) (string, error) {
+// ContainerExecResult 在容器中执行一条命令，返回结果
+func (self Client) ContainerExecResult(ctx context.Context, containerName string, cmd string) (string, error) {
 	execConfig := container.ExecOptions{
 		Privileged:   true,
 		Tty:          false,
 		AttachStdin:  false,
 		AttachStdout: true,
-		AttachStderr: false,
+		AttachStderr: true,
 		Cmd: []string{
 			"/bin/sh",
 			"-c",
 			cmd,
 		},
 	}
-	slog.Debug("command", "exec", []string{
+	slog.Info("command", "exec", []string{
 		"/bin/sh",
 		"-c",
 		cmd,
 	})
-	response, err := Sdk.ContainerExec(ctx, containerName, execConfig)
+	response, err := self.ContainerExec(ctx, containerName, execConfig)
 	if err != nil {
 		return "", err
 	}
 	defer response.Close()
 
-	buffer := new(bytes.Buffer)
-	_, err = io.Copy(buffer, response.Reader)
+	var stdout, stderr bytes.Buffer
+	_, err = stdcopy.StdCopy(&stdout, &stderr, response.Reader)
 	if err != nil {
 		return "", err
 	}
-	cleanOut := self.ExecCleanResult(buffer.Bytes())
-	slog.Debug("command", "clear result", cleanOut)
-	return cleanOut, nil
+	if stderr.Len() > 0 {
+		return "", errors.New(stderr.String())
+	}
+	return stdout.String(), nil
 }
 
 // ContainerExec 在容器内执行一条 shell 命令
-func (self Builder) ContainerExec(ctx context.Context, containerName string, option container.ExecOptions) (types.HijackedResponse, error) {
-	slog.Debug("docker exec", "command", option)
+func (self Client) ContainerExec(ctx context.Context, containerName string, option container.ExecOptions) (types.HijackedResponse, error) {
+	slog.Info("docker exec", "command", option)
 	exec, err := self.Client.ContainerExecCreate(ctx, containerName, option)
 	if err != nil {
 		return types.HijackedResponse{}, err
@@ -154,13 +155,13 @@ func (self Builder) ContainerExec(ctx context.Context, containerName string, opt
 }
 
 // ContainerReadFile 读取容器内的一个文件内容，传入 targetFile 则写入文件 否则返回一个 reader
-func (self Builder) ContainerReadFile(ctx context.Context, containerName string, inContainerPath string, targetFile *os.File) (io.ReadCloser, error) {
+func (self Client) ContainerReadFile(ctx context.Context, containerName string, inContainerPath string, targetFile *os.File) (io.ReadCloser, error) {
 	pathStat, err := self.Client.ContainerStatPath(ctx, containerName, inContainerPath)
 	if err != nil {
 		return nil, err
 	}
 	if !pathStat.Mode.IsRegular() {
-		return nil, function.ErrorMessage(".containerExplorerContentUnsupportedType")
+		return nil, function.ErrorMessage(define.ErrorMessageContainerExplorerContentUnsupportedType)
 	}
 	out, _, err := self.Client.CopyFromContainer(ctx, containerName, inContainerPath)
 	if err != nil {
@@ -168,7 +169,7 @@ func (self Builder) ContainerReadFile(ctx context.Context, containerName string,
 	}
 	// 返回的数据是外部是一个 tar 真正的文件 reader 需要先读一次
 	tarReader := tar.NewReader(out)
-	_, err = tarReader.Next()
+	file, err := tarReader.Next()
 	if err != nil {
 		return nil, err
 	}
@@ -185,5 +186,23 @@ func (self Builder) ContainerReadFile(ctx context.Context, containerName string,
 	if err != nil {
 		return nil, err
 	}
+
+	_ = targetFile.Chmod(file.FileInfo().Mode())
 	return nil, nil
+}
+
+func (self Client) ContainerLogs(ctx context.Context, containerId string, options container.LogsOptions) (io.ReadCloser, error) {
+	inspectInfo, err := self.Client.ContainerInspect(ctx, containerId)
+	if err != nil {
+		return nil, err
+	}
+	reader, err := self.Client.ContainerLogs(ctx, containerId, options)
+	if err != nil {
+		return nil, err
+	}
+	if inspectInfo.Config.Tty {
+		return reader, nil
+	}
+
+	return function.DockerCombinedStream(reader), nil
 }

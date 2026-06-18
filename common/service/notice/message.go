@@ -3,11 +3,11 @@ package notice
 import (
 	"encoding/json"
 	"fmt"
-	"github.com/donknap/dpanel/common/dao"
-	"github.com/donknap/dpanel/common/entity"
-	"github.com/donknap/dpanel/common/function"
 	"runtime"
 	"time"
+
+	"github.com/donknap/dpanel/common/dao"
+	"github.com/donknap/dpanel/common/entity"
 )
 
 var (
@@ -47,8 +47,4 @@ func (self Message) push(level string, title string, message []string) error {
 	fmt.Printf("协程数，%v \n", runtime.NumGoroutine())
 	QueueNoticePushMessage <- row
 	return err
-}
-
-func (self Message) New(title string, message ...string) error {
-	return function.ErrorMessage(title, message...)
 }
